@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""waitfor: wait until something is ready, instead of a hand-written sleep loop.
+
+	waitfor [-t 60] [-i 0.5] http URL [CODE]      until URL answers (any status, or exactly CODE; no redirects)
+	waitfor ... port [HOST:]N                      until a TCP connect succeeds (default host 127.0.0.1)
+	waitfor ... proc PATTERN                       until a process whose command line matches the regex exists
+	waitfor ... gone PID|PATTERN                   until it no longer exists
+	waitfor ... log FILE REGEX                     until a line matching REGEX appears (lines already there count)
+	waitfor ... file PATH                          until it exists and is non-empty
+	waitfor ... ci [-R OWNER/REPO] [SHA]           GitHub Actions runs for SHA (default HEAD): wait for all to finish,
+	                                               print "CONCLUSION URL WORKFLOW" per run, failed logs' tails
+	waitfor ... -- CMD...                          until CMD exits 0
+
+-t is the timeout in seconds, -i the pause between checks. Exit 0 when met (one line: what, after how long),
+124 on timeout (one line: the last state seen), 1 when a ci run did not succeed, 2 on usage/setup errors.
+proc/gone never match waitfor itself or the shells that started it. ci needs gh; it defaults to -t 1800 -i 10.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+
+def die(msg):
+	print(f'waitfor: {msg}', file=sys.stderr)
+	sys.exit(2)
+
+
+def poll(check, timeout, interval):
+	"""Call check(seconds left) until it returns (True, msg); print msg, or exit 124 with the last msg."""
+	start = time.monotonic()
+	while True:
+		ok, msg = check(max(timeout - (time.monotonic() - start), 0.1))
+		took = time.monotonic() - start
+		if ok:
+			print(f'{msg} after {took:.1f}s')
+			return
+		if took >= timeout:
+			print(f'waitfor: timed out after {timeout:g}s: {msg}', file=sys.stderr)
+			sys.exit(124)
+		time.sleep(min(interval, timeout - took))
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+	def redirect_request(self, *_):
+		return None
+
+
+def http(url, code):
+	url = url if '://' in url else f'http://{url}'
+	opener = urllib.request.build_opener(NoRedirect)
+
+	def check(left):
+		try:
+			with opener.open(url, timeout=min(left, 5)) as r:
+				got = r.status
+		except urllib.error.HTTPError as e:
+			got = e.code
+		except (OSError, ValueError) as e:
+			return False, f'{url}: {getattr(e, "reason", e)}'
+		return code is None or got == code, f'{url} answered {got}'
+
+	return check
+
+
+def port(spec):
+	host, _, n = spec.rpartition(':')
+	host, n = host.strip('[]') or '127.0.0.1', int(n)
+
+	def check(left):
+		try:
+			socket.create_connection((host, n), timeout=min(left, 5)).close()
+		except OSError as e:
+			return False, f'{host}:{n}: {e.strerror or e}'
+		return True, f'{host}:{n} is open'
+
+	return check
+
+
+def procs():
+	"""[(pid, command line)] of every process except this one, its ancestors and its children."""
+	out = subprocess.run(['ps', '-ww', '-eo', 'pid=,ppid=,args='], capture_output=True, text=True, check=True).stdout
+	rows = [(int(r[0]), int(r[1]), r[2] if len(r) > 2 else '') for r in (x.split(None, 2) for x in out.splitlines())]
+	parent = {p: pp for p, pp, _ in rows}
+	# The calling shell's command line holds the pattern too (the pgrep -f self-match trap).
+	skip, p = set(), os.getpid()
+	while p > 0 and p not in skip:
+		skip.add(p)
+		p = parent.get(p, 0)
+	return [(p, c) for p, pp, c in rows if p not in skip and pp != os.getpid()]
+
+
+def proc(pattern, gone):
+	rx = re.compile(pattern)
+
+	def check(_):
+		if gone and pattern.isdigit():
+			st = subprocess.run(['ps', '-o', 'stat=', '-p', pattern], capture_output=True, text=True, check=False)
+			state = st.stdout.strip()
+			# A zombie has exited and only waits for its parent to reap it.
+			dead = state[:1] in ('', 'Z')
+			return dead, f'pid {pattern} ' + ('is gone' if dead else f'is running ({state})')
+		hits = [(p, c) for p, c in procs() if rx.search(c)]
+		if not hits:
+			return gone, f'no process matches {pattern!r}'
+		p, c = hits[0]
+		return not gone, f'{len(hits)} process(es) match {pattern!r}, e.g. {p}: {c[:150]}'
+
+	return check
+
+
+def log(path, regex):
+	rx, pos, tail, last = re.compile(regex), 0, b'', ''
+
+	def check(_):
+		nonlocal pos, tail, last
+		try:
+			with open(path, 'rb') as f:
+				if os.fstat(f.fileno()).st_size < pos:
+					pos, tail = 0, b''
+				f.seek(pos)
+				data = f.read()
+		except OSError as e:
+			return False, f'{path}: {e.strerror}'
+		pos += len(data)
+		lines = (tail + data).split(b'\n')
+		# The unfinished last line is checked now and again once it is complete.
+		tail = lines[-1]
+		for line in lines:
+			s = line.decode(errors='replace').rstrip('\r')
+			if rx.search(s):
+				return True, f'{path}: {s[:200]}'
+			last = s.strip() or last
+		return False, f'no line in {path} matches {regex!r}; last line: {last[:200]!r}'
+
+	return check
+
+
+def file(path):
+	def check(_):
+		try:
+			size = os.path.getsize(path)
+		except OSError:
+			return False, f'{path} does not exist'
+		return size > 0, f'{path} has {size} bytes'
+
+	return check
+
+
+def command(cmd):
+	def check(left):
+		try:
+			r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=left, check=False)
+		except subprocess.TimeoutExpired:
+			return False, f'{cmd[0]} still running when time ran out'
+		except OSError as e:
+			die(e)
+		out = (r.stdout + r.stderr).strip().split('\n')[-1]
+		return r.returncode == 0, f'{shlex.join(cmd)} exited {r.returncode}' + (f': {out[:200]}' if out else '')
+
+	return check
+
+
+def gh(args, repo):
+	r = subprocess.run(['gh', *args, *(['-R', repo] if repo else [])], capture_output=True, text=True, check=False)
+	return r.returncode, r.stdout, r.stderr.strip()
+
+
+def ci(a):
+	sha = a.sha or 'HEAD'
+	r = subprocess.run(['git', 'rev-parse', sha], capture_output=True, text=True, check=False)
+	if r.returncode == 0:
+		sha = r.stdout.strip()
+	elif not a.sha:
+		die(f'git rev-parse HEAD: {r.stderr.strip()}')
+	runs, first = [], True
+	fields = 'databaseId,status,conclusion,url,workflowName'
+
+	def check(_):
+		nonlocal runs, first
+		code, out, err = gh(['run', 'list', '--commit', sha, '--json', fields], a.repo)
+		# A first failure is a setup problem (no repo, not logged in); later ones are retried.
+		if code and first:
+			die(f'gh run list: {err}')
+		first = False
+		if code:
+			return False, f'gh run list: {err}'
+		runs = json.loads(out)
+		if not runs:
+			return False, f'no runs for {sha[:12]} yet (pushed?)'
+		todo = [f'{x["workflowName"]} {x["status"]}' for x in runs if x['status'] != 'completed']
+		if todo:
+			return False, f'{len(todo)} of {len(runs)} runs for {sha[:12]} not done: {", ".join(todo)}'
+		return True, f'{len(runs)} run(s) for {sha[:12]} completed'
+
+	poll(check, getattr(a, 't', 1800), getattr(a, 'i', 10))
+	bad = [x for x in runs if x['conclusion'] not in ('success', 'skipped', 'neutral')]
+	for x in runs:
+		print(f'{x["conclusion"]} {x["url"]} {x["workflowName"]}')
+	for x in bad:
+		_, out, err = gh(['run', 'view', str(x['databaseId']), '--log-failed'], a.repo)
+		print(f'--- {x["workflowName"]} ({x["conclusion"]}), last 40 lines of failed steps:')
+		print('\n'.join((out.rstrip() or err).split('\n')[-40:]))
+	sys.exit(1 if bad else 0)
+
+
+def main():
+	argv = sys.argv[1:]
+	cmd = argv[argv.index('--') + 1 :] if '--' in argv else None
+	if cmd is not None:
+		argv = argv[: argv.index('--')]
+	common = argparse.ArgumentParser(add_help=False)
+	common.add_argument('-t', '--timeout', dest='t', type=float, default=argparse.SUPPRESS, help='seconds (60)')
+	common.add_argument('-i', '--interval', dest='i', type=float, default=argparse.SUPPRESS, help='seconds (0.5)')
+	ap = argparse.ArgumentParser(
+		description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter, parents=[common]
+	)
+	ap.epilog = __doc__.split('\n', 2)[2]
+	sp = ap.add_subparsers(dest='kind', required=cmd is None)
+	p = sp.add_parser('http', parents=[common])
+	p.add_argument('url')
+	p.add_argument('code', nargs='?', type=int)
+	sp.add_parser('port', parents=[common]).add_argument('spec', metavar='[HOST:]N')
+	sp.add_parser('proc', parents=[common]).add_argument('pattern')
+	sp.add_parser('gone', parents=[common]).add_argument('pattern', metavar='PID|PATTERN')
+	p = sp.add_parser('log', parents=[common])
+	p.add_argument('path')
+	p.add_argument('regex')
+	sp.add_parser('file', parents=[common]).add_argument('path')
+	p = sp.add_parser('ci', parents=[common])
+	p.add_argument('-R', '--repo', metavar='OWNER/REPO')
+	p.add_argument('sha', nargs='?')
+	a = ap.parse_args(argv)
+	if cmd is not None and (a.kind or not cmd):
+		ap.error('give either a check or -- CMD...')
+	if a.kind == 'ci':
+		ci(a)
+	make = {
+		None: lambda: command(cmd),
+		'http': lambda: http(a.url, a.code),
+		'port': lambda: port(a.spec),
+		'proc': lambda: proc(a.pattern, False),
+		'gone': lambda: proc(a.pattern, True),
+		'log': lambda: log(a.path, a.regex),
+		'file': lambda: file(a.path),
+	}[a.kind]
+	try:
+		check = make()
+	except (re.error, ValueError) as e:
+		die(f'bad argument: {e}')
+	poll(check, getattr(a, 't', 60), getattr(a, 'i', 0.5))
+
+
+if __name__ == '__main__':
+	main()

@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""subst: exact search/replace edits from SEARCH/REPLACE blocks on stdin, all-or-nothing.
+
+	subst [-n] [-a] [FILE] <<'EOF'
+	<<<<<<< SEARCH
+	exact old text
+	=======
+	new text
+	>>>>>>> REPLACE
+	EOF
+
+A line naming a file directly above a block switches to that file, so one call can edit several.
+SEARCH is exact text and may be part of a line. Each SEARCH must match exactly once (-a: at least
+once, all replaced). If any block fails, nothing is written. -n prints the diff without writing.
+"""
+
+import argparse
+import difflib
+import os
+import sys
+import tempfile
+
+START, MID, END = '<<<<<<< SEARCH', '=======', '>>>>>>> REPLACE'
+
+
+def parse(text, default):
+	"""Return [(file, old, new, line_no)]."""
+	blocks, lines, i, last = [], text.splitlines(keepends=True), 0, None
+	while i < len(lines):
+		if lines[i].rstrip('\r\n') != START:
+			if lines[i].strip():
+				last = lines[i].strip()
+			i += 1
+			continue
+		start, i = i + 1, i + 1
+		old, new = [], []
+		while i < len(lines) and lines[i].rstrip('\r\n') != MID:
+			old.append(lines[i])
+			i += 1
+		i += 1
+		while i < len(lines) and lines[i].rstrip('\r\n') != END:
+			new.append(lines[i])
+			i += 1
+		if i >= len(lines):
+			sys.exit(f'subst: block at line {start} has no {END}')
+		i += 1
+		# With a default FILE, a line above only switches files when it names an existing one.
+		path = last if last and (default is None or os.path.isfile(last)) else default
+		if path is None:
+			sys.exit(f'subst: block at line {start}: no file (give FILE or put the path above the block)')
+		blocks.append((path, ''.join(old), ''.join(new), start))
+		last = None
+	return blocks
+
+
+def hint(text, old):
+	"""Where old would match if indentation/trailing whitespace were ignored."""
+	want = [x.strip() for x in old.strip('\n').split('\n')]
+	have = text.split('\n')
+	for n in range(len(have) - len(want) + 1):
+		if [x.strip() for x in have[n : n + len(want)]] == want:
+			return f'; matches at line {n + 1} if whitespace is ignored (tabs vs spaces?)'
+	first = next((w for w in want if w), '')
+	near = difflib.get_close_matches(first, [x.strip() for x in have], n=1, cutoff=0.6)
+	if near:
+		return f'; closest line {[x.strip() for x in have].index(near[0]) + 1}: {near[0][:100]!r}'
+	return ''
+
+
+def main():
+	ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+	ap.add_argument('file', nargs='?', help='default file for blocks with no path line above them')
+	ap.add_argument('-n', '--dry-run', action='store_true', help='print the diff, write nothing')
+	ap.add_argument('-a', '--all', action='store_true', help='replace every occurrence (at least one)')
+	args = ap.parse_args()
+	blocks = parse(sys.stdin.read(), args.file)
+	if not blocks:
+		sys.exit(f'subst: no blocks on stdin (expected {START} / {MID} / {END})')
+
+	texts, orig, errors, counts = {}, {}, [], {}
+	for path, search, replace, line in blocks:
+		old, new = search, replace
+		if path not in texts:
+			try:
+				with open(path, encoding='utf-8', newline='') as f:
+					texts[path] = orig[path] = f.read()
+			except OSError as e:
+				sys.exit(f'subst: {e}')
+		if not old:
+			errors.append(f'{path}: block at line {line}: empty SEARCH')
+			continue
+		text = texts[path]
+		# Blocks written with LF still match a CRLF file.
+		if '\r\n' in text and '\r\n' not in old:
+			old, new = old.replace('\n', '\r\n'), new.replace('\n', '\r\n')
+		n = text.count(old)
+		# The block's last newline is only layout: without it, SEARCH can end mid-line.
+		if n == 0 and old.endswith('\n'):
+			eol = '\r\n' if old.endswith('\r\n') else '\n'
+			old, new = old.removesuffix(eol), new.removesuffix(eol)
+			n = text.count(old)
+		if n == 0 or (n > 1 and not args.all):
+			why = 'not found' + hint(text, old) if n == 0 else f'found {n} times (add context, or -a)'
+			errors.append(f'{path}: block at line {line}: SEARCH {why}')
+			continue
+		texts[path] = text.replace(old, new)
+		counts[path] = counts.get(path, 0) + n
+	if errors:
+		sys.exit('\n'.join(errors) + '\nsubst: nothing written')
+
+	for path, text in texts.items():
+		if text == orig[path]:
+			continue
+		if args.dry_run:
+			sys.stdout.writelines(difflib.unified_diff(orig[path].splitlines(True), text.splitlines(True), path, path))
+			continue
+		# Temp file + rename: a crash never leaves a half-written file; the mode is kept.
+		real = os.path.realpath(path)
+		fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix='.subst-')
+		try:
+			with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+				f.write(text)
+			os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+			os.replace(tmp, real)
+		except BaseException:
+			os.unlink(tmp)
+			raise
+		print(f'{path}: {counts[path]} replacement(s)')
+
+
+if __name__ == '__main__':
+	main()

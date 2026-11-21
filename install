@@ -1,0 +1,13 @@
+#!/bin/sh
+# Links every tool in bin/ into ~/.local/bin (or the folder given), so a git pull updates them.
+set -eu
+cd "$(dirname "$0")"
+dest=${1:-$HOME/.local/bin}
+mkdir -p "$dest"
+n=0
+for f in bin/*; do
+    ln -sfn "$PWD/$f" "$dest/${f##*/}"
+    n=$((n + 1))
+done
+echo "Linked $n tools into $dest."
+echo "Add agent-instructions.md to your agent's instructions (CLAUDE.md, AGENTS.md, copilot-instructions.md)."

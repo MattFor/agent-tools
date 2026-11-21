@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""tui: drive a terminal program in a private tmux server and read its screen as text.
+
+	tui start NAME [-s 140x42] [-c DIR] -- CMD...   run CMD in server `tmux -L agent-NAME` (replaces one of that name)
+	tui keys NAME [-d 0.3] KEYS...                  send tmux key names (Enter, Escape, C-c, Up, F5, ...) one by one,
+	                                                -d seconds apart, then print the screen
+	tui type NAME TEXT                              type TEXT literally, then print the screen
+	tui screen NAME [--lines A-B] [--ansi]          print the screen (A-B: only those lines, 1-based)
+	tui wait NAME REGEX [-t 10]                     until the screen matches REGEX, print it; exit 124 on timeout
+	tui stop NAME                                   kill that server
+
+When CMD exits the pane shows "[exited N]" and stays readable until stop. A single CMD argument is run by sh,
+several are run as given. $TUI_PULSE_SINK, when set, becomes CMD's PULSE_SINK so sound goes to that sink.
+Only servers named agent-* are touched. To watch one yourself: tmux -L agent-NAME attach
+"""
+
+import argparse
+import contextlib
+import os
+import re
+import subprocess
+import sys
+import time
+
+# Ignoring INT here would be inherited by CMD; a trap is reset for it, so C-c still reaches CMD.
+WRAP = 'trap : INT; "$@"; echo "[exited $?]"; while :; do sleep 3600; done'
+ENV = {k: v for k, v in os.environ.items() if k not in ('TMUX', 'TMUX_PANE')}
+
+
+def esc(args):
+	"""tmux reads an argument ending in ';' as a command separator; '\\;' keeps it literal."""
+	return [a[:-1] + '\\;' if a.endswith(';') else a for a in args]
+
+
+def tmux(name, *args, env=ENV, check=True):
+	r = subprocess.run(['tmux', '-L', f'agent-{name}', *args], capture_output=True, text=True, env=env, check=False)
+	if check and r.returncode:
+		err = r.stderr.strip()
+		if 'no server running' in err or 'error connecting' in err:
+			err = f'no session {name} (tui start {name} -- CMD...)'
+		sys.exit(f'tui: {err}')
+	return r
+
+
+def screen(name, ansi=False):
+	lines = tmux(name, 'capture-pane', '-p', *(['-e'] if ansi else [])).stdout.split('\n')
+	while lines and not lines[-1].strip():
+		lines.pop()
+	return lines
+
+
+def name_type(s):
+	if not re.fullmatch(r'[\w-]+', s):
+		raise argparse.ArgumentTypeError('letters, digits, _ and - only')
+	return s
+
+
+def main():
+	argv = sys.argv[1:]
+	cmd = argv[argv.index('--') + 1 :] if argv[:1] == ['start'] and '--' in argv else None
+	if cmd is not None:
+		argv = argv[: argv.index('--')]
+	ap = argparse.ArgumentParser(
+		description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter
+	)
+	ap.epilog = __doc__.split('\n', 2)[2]
+	sp = ap.add_subparsers(dest='cmd', required=True)
+	p = sp.add_parser('start')
+	p.add_argument('name', type=name_type)
+	p.add_argument('-s', '--size', default='140x42')
+	p.add_argument('-c', '--dir', default='.')
+	p = sp.add_parser('keys')
+	p.add_argument('name', type=name_type)
+	p.add_argument('-d', '--delay', type=float, default=0.3)
+	p.add_argument('keys', nargs='+')
+	p = sp.add_parser('type')
+	p.add_argument('name', type=name_type)
+	p.add_argument('text')
+	p = sp.add_parser('screen')
+	p.add_argument('name', type=name_type)
+	p.add_argument('--lines', metavar='A-B')
+	p.add_argument('--ansi', action='store_true')
+	p = sp.add_parser('wait')
+	p.add_argument('name', type=name_type)
+	p.add_argument('regex')
+	p.add_argument('-t', '--timeout', type=float, default=10)
+	sp.add_parser('stop').add_argument('name', type=name_type)
+	a = ap.parse_args(argv)
+	name = a.name
+
+	if a.cmd == 'start':
+		size = re.fullmatch(r'(\d+)x(\d+)', a.size)
+		if not cmd or not size:
+			ap.error('start needs -s WxH (if given) and -- CMD...')
+		env = dict(ENV)
+		if os.environ.get('TUI_PULSE_SINK'):
+			env['PULSE_SINK'] = os.environ['TUI_PULSE_SINK']
+		tmux(name, 'kill-server', check=False)
+		run = ['sh', '-c', cmd[0]] if len(cmd) == 1 else cmd
+		w, h = size.groups()
+		new = ['new-session', '-d', '-x', w, '-y', h, '-c', os.path.abspath(a.dir), 'sh', '-c', WRAP, 'sh', *esc(run)]
+		tmux(name, '-f', os.devnull, 'set', '-g', 'status', 'off', ';', *new, env=env)
+		print(f'started {name}: tmux -L agent-{name}')
+	elif a.cmd == 'keys':
+		for k in a.keys:
+			tmux(name, 'send-keys', '--', *esc([k]))
+			time.sleep(a.delay)
+		print('\n'.join(screen(name)))
+	elif a.cmd == 'type':
+		tmux(name, 'send-keys', '-l', '--', *esc([a.text]))
+		time.sleep(0.3)
+		print('\n'.join(screen(name)))
+	elif a.cmd == 'screen':
+		lines = screen(name, a.ansi)
+		if a.lines:
+			m = re.fullmatch(r'(\d+)(?:-(\d+))?', a.lines)
+			if not m:
+				ap.error('--lines takes A-B or A')
+			lines = lines[int(m[1]) - 1 : int(m[2] or m[1])]
+		print('\n'.join(lines))
+	elif a.cmd == 'wait':
+		try:
+			rx, end = re.compile(a.regex, re.MULTILINE), time.monotonic() + a.timeout
+		except re.error as e:
+			ap.error(f'bad REGEX: {e}')
+		while not rx.search(text := '\n'.join(screen(name))):
+			if time.monotonic() >= end:
+				print(text, flush=True)
+				print(f'tui: timed out after {a.timeout:g}s waiting for {a.regex!r}', file=sys.stderr)
+				sys.exit(124)
+			time.sleep(0.2)
+		print(text)
+	else:
+		sock = tmux(name, 'display', '-p', '#{socket_path}', check=False).stdout.strip()
+		r = tmux(name, 'kill-server', check=False)
+		# tmux leaves the socket file behind.
+		with contextlib.suppress(OSError):
+			os.unlink(sock)
+		print(f'stopped {name}' if r.returncode == 0 else f'no session {name}')
+
+
+if __name__ == '__main__':
+	main()

@@ -1,0 +1,289 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+const { pathToFileURL } = require('node:url');
+
+const USAGE = `webshot: load a page in headless Chromium; screenshot, eval JS, report errors.
+
+usage: webshot URL [OUT.png] [options]
+  --size WxH        viewport (default 1440x900, --mobile 390x844)
+  --full            capture the whole page, not just the viewport
+  --mobile          phone: 390x844 at 3x, mobile user agent, touch
+  --dark            prefers-color-scheme: dark
+  --wait MS         sleep MS milliseconds
+  --wait-for CSS    wait until CSS matches an element
+  --click CSS       click the centre of the element CSS matches
+  --type CSS TEXT   focus the element, replace its text with TEXT
+  --eval JS         print the JSON value of JS on stdout (after the steps, before the screenshot)
+  --timeout S       give up after S seconds (default 30)
+
+--wait, --wait-for, --click and --type run in the order given, once the page has loaded.
+Stderr gets the final URL, HTTP status, console errors and uncaught exceptions, one per line.
+URL may also be a local file or host:port (http:// assumed).
+Browser: $WEBSHOT_BROWSER, else the newest Playwright chrome-headless-shell, else chromium,
+google-chrome or chrome-headless-shell on PATH.
+Exit: 0 loaded, 1 page failed to load (network error or HTTP >= 400), 2 usage, 3 other error.`;
+
+const report = { url: null, status: null, errors: [], saved: null };
+let proc;
+let profile;
+let done = false;
+let step = 'starting the browser';
+
+const say = (line) => process.stderr.write(`${line}\n`);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const where = (url, line) => (url ? ` (${url}${line === undefined ? '' : `:${line + 1}`})` : '');
+
+function usage(msg) {
+    if (!msg) process.stdout.write(`${USAGE}\n`);
+    else say(`webshot: ${msg} (webshot -h for help)`);
+    process.exit(msg ? 2 : 0);
+}
+
+function parseArgs(argv) {
+    const o = { full: false, mobile: false, dark: false, timeout: 30, steps: [], pos: [] };
+    for (let i = 0; i < argv.length; i++) {
+        const a = argv[i];
+        const val = () => (i + 1 < argv.length ? argv[++i] : usage(`${a} needs a value`));
+        const num = () => (/^\d+$/.test(argv[i + 1]) ? Number(argv[++i]) : usage(`${a} needs a number`));
+        if (a === '-h' || a === '--help') usage();
+        else if (a === '--full' || a === '--mobile' || a === '--dark') o[a.slice(2)] = true;
+        else if (a === '--size')
+            o.size = /^(\d+)x(\d+)$/.exec(val())?.slice(1).map(Number) ?? usage('--size needs WxH');
+        else if (a === '--eval') o.eval = val();
+        else if (a === '--timeout') o.timeout = num();
+        else if (a === '--wait') o.steps.push([a, num()]);
+        else if (a === '--wait-for' || a === '--click') o.steps.push([a, val()]);
+        else if (a === '--type') o.steps.push([a, val(), val()]);
+        else if (a.startsWith('-')) usage(`unknown option ${a}`);
+        else o.pos.push(a);
+    }
+    if (o.pos.length < 1 || o.pos.length > 2) usage('expected URL [OUT.png]');
+    return o;
+}
+
+function toUrl(s) {
+    if (/^[a-z][a-z\d+.-]*:(?!\d)/i.test(s)) return s; // has a scheme; host:port does not count
+    return fs.existsSync(s) ? pathToFileURL(path.resolve(s)).href : `http://${s}`;
+}
+
+function findBrowser() {
+    if (process.env.WEBSHOT_BROWSER) return process.env.WEBSHOT_BROWSER;
+    const isExe = (p) => {
+        try {
+            fs.accessSync(p, fs.constants.X_OK);
+            return fs.statSync(p).isFile();
+        } catch {
+            return false;
+        }
+    };
+    const cache = path.join(os.homedir(), '.cache', 'ms-playwright');
+    const shells = (fs.existsSync(cache) ? fs.readdirSync(cache) : [])
+        .filter((d) => /^chromium_headless_shell-\d+$/.test(d))
+        .sort((a, b) => b.split('-')[1] - a.split('-')[1])
+        .flatMap((d) =>
+            fs.readdirSync(path.join(cache, d)).map((s) => path.join(cache, d, s, 'chrome-headless-shell'))
+        );
+    const names = ['chromium', 'google-chrome', 'chrome-headless-shell'];
+    const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+    const found = [...shells, ...names.flatMap((n) => dirs.map((d) => path.join(d, n)))].find(isExe);
+    if (found) return found;
+    throw new Error(
+        `no browser found; searched $WEBSHOT_BROWSER, ${cache}/chromium_headless_shell-*/, and ${names.join(', ')} on PATH ` +
+            '(install one: npx playwright install --only-shell chromium)'
+    );
+}
+
+async function finish(code, msg) {
+    if (done) return;
+    done = true;
+    if (report.url) say(`url: ${report.url}\nstatus: ${report.status ?? '-'}`);
+    report.errors.forEach(say);
+    if (report.saved) say(`saved: ${report.saved}`);
+    if (msg) say(`webshot: ${msg}`);
+    if (proc?.pid && proc.exitCode === null && proc.signalCode === null) {
+        const exited = new Promise((resolve) => proc.once('exit', resolve));
+        try {
+            // Whole process group: renderer and GPU children too.
+            process.kill(-proc.pid, 'SIGKILL');
+        } catch {}
+        await exited;
+    }
+    if (profile) fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
+    process.exit(code);
+}
+
+async function main() {
+    const o = parseArgs(process.argv.slice(2));
+    if (typeof WebSocket === 'undefined')
+        throw new Error(`needs Node 22+ (global WebSocket), this is ${process.version}`);
+    setTimeout(() => finish(3, `timed out after ${o.timeout}s while ${step}`), o.timeout * 1000);
+    const browser = findBrowser();
+    // Not under $TMPDIR: a long profile path overflows Chromium's singleton socket path and it aborts.
+    profile = fs.mkdtempSync('/tmp/webshot-');
+    const args = [
+        '--headless',
+        '--remote-debugging-port=0',
+        `--user-data-dir=${profile}`,
+        '--hide-scrollbars',
+        '--mute-audio'
+    ];
+    proc = spawn(browser, args, { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    const wsUrl = await new Promise((resolve, reject) => {
+        let log = '';
+        proc.on('error', (e) => reject(new Error(`cannot run ${browser}: ${e.message}`)));
+        proc.on('exit', () =>
+            reject(new Error(`${browser} exited before DevTools started: ${log.trim().slice(-500)}`))
+        );
+        proc.stderr.on('data', (d) => {
+            log += d;
+            const m = /DevTools listening on (ws:\/\/\S+)/.exec(log);
+            if (m) resolve(m[1]);
+        });
+    });
+
+    const ws = new WebSocket(wsUrl);
+    const pending = new Map();
+    const handlers = {};
+    let nextId = 0;
+    let sessionId;
+    const send = (method, params = {}) =>
+        new Promise((resolve, reject) => {
+            pending.set(++nextId, { resolve, reject, method });
+            ws.send(JSON.stringify({ id: nextId, method, params, sessionId }));
+        });
+    ws.onmessage = (e) => {
+        const m = JSON.parse(e.data);
+        const p = pending.get(m.id);
+        if (!p) return handlers[m.method]?.(m.params);
+        pending.delete(m.id);
+        if (m.error) p.reject(new Error(`${p.method}: ${m.error.message}`));
+        else p.resolve(m.result);
+    };
+    ws.onclose = () => finish(3, `browser closed the DevTools connection while ${step}`);
+    await new Promise((resolve, reject) => {
+        ws.onopen = resolve;
+        ws.onerror = () => reject(new Error(`cannot connect to ${wsUrl}`));
+    });
+
+    const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
+    const { userAgent } = await send('Browser.getVersion');
+    ({ sessionId } = await send('Target.attachToTarget', { targetId, flatten: true }));
+    let loading = false;
+    const mainFrame = (fn) => (p) => p.frameId === targetId && fn(p);
+    Object.assign(handlers, {
+        'Runtime.consoleAPICalled': (p) => {
+            if (p.type !== 'error') return;
+            const text = p.args.map((a) =>
+                a.value !== undefined ? String(a.value) : (a.description ?? a.type).split('\n')[0]
+            );
+            const f = p.stackTrace?.callFrames[0];
+            report.errors.push(`console error: ${text.join(' ').replace(/\n/g, ' ')}${where(f?.url, f?.lineNumber)}`);
+        },
+        'Runtime.exceptionThrown': ({ exceptionDetails: d }) => {
+            const text = (d.exception?.description ?? d.text).split('\n')[0];
+            report.errors.push(`page error: ${text}${where(d.url, d.lineNumber)}`);
+        },
+        'Log.entryAdded': ({ entry: e }) => {
+            if (e.level === 'error') report.errors.push(`console error: ${e.text}${where(e.url, e.lineNumber)}`);
+        },
+        'Network.responseReceived': mainFrame((p) => {
+            if (p.type === 'Document') [report.url, report.status] = [p.response.url, p.response.status];
+        }),
+        'Page.navigatedWithinDocument': mainFrame((p) => (report.url = p.url)),
+        'Page.frameStartedLoading': mainFrame(() => (loading = true)),
+        'Page.frameStoppedLoading': mainFrame(() => (loading = false))
+    });
+    await Promise.all(['Page', 'Runtime', 'Log', 'Network'].map((d) => send(`${d}.enable`)));
+
+    const [width, height] = o.size ?? (o.mobile ? [390, 844] : [1440, 900]);
+    await send('Emulation.setDeviceMetricsOverride', {
+        width,
+        height,
+        deviceScaleFactor: o.mobile ? 3 : 1,
+        mobile: o.mobile
+    });
+    if (o.mobile) {
+        // Derived from the real UA so the Chrome version always matches the browser.
+        const ua = userAgent.replace(/\(.*?\)/, '(Linux; Android 10; K)').replace('HeadlessChrome', 'Chrome');
+        await send('Emulation.setUserAgentOverride', { userAgent: ua.replace(/Safari\/\S+$/, 'Mobile $&') });
+        await send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
+    }
+    if (o.dark)
+        await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'dark' }] });
+
+    const url = toUrl(o.pos[0]);
+    report.url = url;
+    step = `loading ${url}`;
+    loading = true;
+    const nav = await send('Page.navigate', { url });
+    if (nav.errorText) return finish(1, `${url}: ${nav.errorText}`);
+    while (loading) await sleep(50);
+
+    const evaluate = async (expression) => {
+        const r = await send('Runtime.evaluate', {
+            expression,
+            returnByValue: true,
+            awaitPromise: true,
+            replMode: true
+        });
+        const d = r.exceptionDetails;
+        if (d) throw new Error((d.exception?.description ?? d.text).split('\n')[0]);
+        return r.result;
+    };
+    const onElement = (css, body) =>
+        evaluate(`(() => {
+            const e = document.querySelector(${JSON.stringify(css)});
+            if (!e) throw new Error('no element matches ' + ${JSON.stringify(JSON.stringify(css))});
+            ${body}
+        })()`);
+    for (const [flag, arg, text] of o.steps) {
+        step = `${flag} ${arg}`;
+        if (flag === '--wait') await sleep(arg);
+        else if (flag === '--wait-for') {
+            while (!(await evaluate(`!!document.querySelector(${JSON.stringify(arg)})`)).value) await sleep(100);
+        } else if (flag === '--type') {
+            await onElement(arg, 'e.focus(); e.select?.();');
+            await send('Input.insertText', { text });
+        } else {
+            const box = "e.scrollIntoView({ block: 'center' }); const b = e.getBoundingClientRect();";
+            const [x, y] = (await onElement(arg, `${box} return [b.x + b.width / 2, b.y + b.height / 2];`)).value;
+            await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+            for (const type of ['mousePressed', 'mouseReleased']) {
+                await send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
+            }
+            // A click that navigates starts loading within this; then wait for that load.
+            await sleep(100);
+            while (loading) await sleep(50);
+        }
+    }
+
+    if (o.eval !== undefined) {
+        step = '--eval';
+        const r = await evaluate(o.eval);
+        process.stdout.write(`${r.unserializableValue ?? JSON.stringify(r.value) ?? 'undefined'}\n`);
+    }
+    if (o.pos[1]) {
+        step = 'taking the screenshot';
+        const shot = { format: 'png' };
+        if (o.full) {
+            const { cssContentSize: c } = await send('Page.getLayoutMetrics');
+            Object.assign(shot, {
+                captureBeyondViewport: true,
+                clip: { x: 0, y: 0, width: c.width, height: c.height, scale: 1 }
+            });
+        }
+        const png = Buffer.from((await send('Page.captureScreenshot', shot)).data, 'base64');
+        fs.writeFileSync(o.pos[1], png);
+        report.saved = `${o.pos[1]} (${png.readUInt32BE(16)}x${png.readUInt32BE(20)})`;
+    }
+    return finish(report.status >= 400 ? 1 : 0);
+}
+
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => finish(3, `got ${sig}`));
+process.on('uncaughtException', (e) => finish(3, e.message));
+main().catch((e) => finish(3, step === 'starting the browser' ? e.message : `${e.message} (while ${step})`));

@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""jshape: the structure of a JSON or JSON Lines file, one line per path.
+
+	jshape [FILE|-] [-d 4] [-n 3]      .a.b array len=2-9 / .a.b[] object keys=id,name,tags? / .a.b[].id int  e.g. 42
+	jshape --paths [FILE|-]            gron-style `.a.b[3].c = "v"` lines, one per value, for grepping
+
+All items of a list share the path `[]`. A key followed by ? is missing from some of the objects at that path.
+-d is the deepest path shown, -n the number of distinct sample values per path; strings are cut to 60 chars.
+A file with one JSON value per line (JSON Lines) is read as a list of them.
+"""
+
+import argparse
+import json
+import re
+import sys
+
+KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+MAX_KEYS = 40
+
+
+def kind(v):
+	if isinstance(v, bool):
+		return 'bool'
+	return {dict: 'object', list: 'array', str: 'str', int: 'int', float: 'float'}.get(type(v), 'null')
+
+
+def step(path, key):
+	return f'{path}.{key}' if KEY.fullmatch(key) else f'{path}[{json.dumps(key, ensure_ascii=False)}]'
+
+
+def show(path):
+	return path if path.startswith('.') else '.' + path
+
+
+def sample(v):
+	s = json.dumps(v, ensure_ascii=False)
+	return s if len(s) <= 62 or not isinstance(v, str) else s[:61] + '…"'
+
+
+def walk(v, node, depth, a):
+	t = kind(v)
+	node['types'][t] = node['types'].get(t, 0) + 1
+	if t == 'object':
+		node['objs'] += 1
+		for k, x in v.items():
+			node['keys'][k] = node['keys'].get(k, 0) + 1
+			if depth < a.depth:
+				walk(x, node['kids'].setdefault(k, new()), depth + 1, a)
+	elif t == 'array':
+		node['lens'].append(len(v))
+		if depth < a.depth:
+			for x in v:
+				walk(x, node['kids'].setdefault(None, new()), depth + 1, a)
+	elif len(node['samples']) < a.n and (s := sample(v)) not in node['samples']:
+		node['samples'].append(s)
+
+
+def new():
+	return {'types': {}, 'objs': 0, 'keys': {}, 'lens': [], 'samples': [], 'kids': {}}
+
+
+def report(node, path, out):
+	line = f'{show(path)} {"|".join(node["types"])}'
+	if node['lens']:
+		lo, hi = min(node['lens']), max(node['lens'])
+		line += f' len={lo}' if lo == hi else f' len={lo}-{hi}'
+	keys = list(node['keys'].items())
+	if keys:
+		line += ' keys=' + ','.join(k + ('' if c == node['objs'] else '?') for k, c in keys[:MAX_KEYS])
+		line += f',… {len(keys) - MAX_KEYS} more' if len(keys) > MAX_KEYS else ''
+	if node['samples']:
+		line += '  e.g. ' + ', '.join(node['samples'])
+	out.append(line)
+	for k, kid in list(node['kids'].items())[:MAX_KEYS]:
+		report(kid, path + '[]' if k is None else step(path, k), out)
+
+
+def paths(v, path, out):
+	if isinstance(v, dict) and v:
+		for k, x in v.items():
+			paths(x, step(path, k), out)
+	elif isinstance(v, list) and v:
+		for i, x in enumerate(v):
+			paths(x, f'{path}[{i}]', out)
+	else:
+		out.append(f'{show(path)} = {json.dumps(v, ensure_ascii=False)}')
+
+
+def load(text):
+	"""(value, is JSON Lines)."""
+	try:
+		return json.loads(text), False
+	except ValueError as e:
+		try:
+			return [json.loads(x) for x in text.splitlines() if x.strip()], True
+		except ValueError:
+			sys.exit(f'jshape: not JSON or JSON Lines: {e}')
+
+
+def main():
+	ap = argparse.ArgumentParser(
+		description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter
+	)
+	ap.epilog = __doc__.split('\n', 2)[2]
+	ap.add_argument('file', nargs='?', default='-')
+	ap.add_argument('-d', '--depth', type=int, default=4)
+	ap.add_argument('-n', type=int, default=3)
+	ap.add_argument('--paths', action='store_true')
+	a = ap.parse_args()
+	try:
+		if a.file == '-':
+			text = sys.stdin.read()
+		else:
+			with open(a.file, encoding='utf-8') as f:
+				text = f.read()
+	except OSError as e:
+		sys.exit(f'jshape: {e}')
+	v, lines = load(text)
+	out = []
+	if a.paths:
+		paths(v, '', out)
+	else:
+		root = new()
+		walk(v, root, 0, a)
+		report(root, '', out)
+		if lines:
+			out[0] += '  (JSON Lines: one value per line)'
+	try:
+		print('\n'.join(out))
+	except BrokenPipeError:
+		sys.stderr.close()
+
+
+if __name__ == '__main__':
+	main()

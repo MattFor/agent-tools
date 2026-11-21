@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""xlab: drive X11 GUIs on a private display: start one, find windows, click and type, take screenshots.
+
+	eval "$(xlab up [WxH])"                     Xvfb on the first free :90+, xfwm4 (compositor off), pulse null sink
+	xlab win PATTERN [-t 20] [--class|--pid]    wait for a visible window, print "0x0a00017 1280x800+0+0 Title"
+	xlab input [-w WIN] STEPS...                click X Y | dclick X Y | rclick X Y | move X Y
+	                                            key COMBO | type TEXT | wait SECS | focus
+	xlab shot [-w WIN|root] [--crop WxH+X+Y] [--scale W] FILE.png    print "FILE WxH BYTESB"
+	xlab down [:N]                              stop what up started on that display, unload its sink
+
+up prints `export DISPLAY=:N` and `export PULSE_SINK=xlab_N`: start apps with both so they draw there and play
+to the null sink. -d :N (or $DISPLAY) picks the display for every subcommand. PATTERN is xdotool's
+case-insensitive regex on the title (or class/pid); WIN is a window id or a PATTERN waited for like win.
+With -w, coordinates are relative to the window; focus activates it (needed before key/type).
+Displays below :90 are real ones: input on them is refused, win and shot read them only with an explicit -d.
+Exit codes: 0 ok, 1 error, 2 usage, 124 timeout, 127 missing tool.
+"""
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+STATE = (
+	os.path.join(os.environ['XDG_RUNTIME_DIR'], 'xlab')
+	if os.environ.get('XDG_RUNTIME_DIR')
+	else f'/tmp/xlab-{os.getuid()}'
+)
+XY = (r'-?\d+', r'-?\d+')
+STEPS = {
+	'click': XY,
+	'dclick': XY,
+	'rclick': XY,
+	'move': XY,
+	'key': ('.+',),
+	'type': ('.*',),
+	'wait': (r'\d*\.?\d+',),
+	'focus': (),
+}
+STEP_USAGE = 'click X Y | dclick X Y | rclick X Y | move X Y | key COMBO | type TEXT | wait SECS | focus'
+BUTTONS = {'click': ['click', '1'], 'dclick': ['click', '--repeat', '2', '1'], 'rclick': ['click', '3'], 'move': []}
+
+
+def die(msg, code=1):
+	print(f'xlab: {msg}', file=sys.stderr)
+	sys.exit(code)
+
+
+def need(*tools):
+	for t in tools:
+		if not shutil.which(t):
+			die(f'{t} not found; install it', 127)
+
+
+def run(*cmd, check=True):
+	r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+	if check and r.returncode:
+		die(f'{" ".join(cmd)}: {r.stderr.strip() or f"exit {r.returncode}"}')
+	return r
+
+
+def display_num(d):
+	m = re.fullmatch(r'[^:]*:(\d+)(?:\.\d+)?', d or '')
+	if not m:
+		die(f'bad or missing display {d!r} (pass -d :N or set DISPLAY)', 2)
+	return int(m.group(1))
+
+
+def state_dir():
+	os.makedirs(STATE, mode=0o700, exist_ok=True)
+	st = os.lstat(STATE)
+	# /tmp is shared: refuse a dir someone else planted there.
+	if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+		die(f'{STATE} is not a directory owned by you')
+	return STATE
+
+
+def alive(pid, n):
+	"""pid runs and is ours for display :n (a reused pid has other args; a zombie has none)."""
+	try:
+		with open(f'/proc/{pid}/cmdline', 'rb') as f:
+			args = f.read().decode(errors='replace').split('\0')
+	except OSError:
+		return False
+	return f':{n}' in args or f'--display=:{n}' in args
+
+
+def up(size):
+	if not re.fullmatch(r'\d+x\d+', size):
+		die(f'size must be WxH, got {size!r}', 2)
+	need('Xvfb', 'xdotool')
+	base, err = state_dir(), ''
+	for n in range(90, 200):
+		if (old := load(n)) and alive(old.get('xvfb'), n):
+			continue
+		if old:
+			stop(n)  # left by a run whose Xvfb died without `down`
+		# Unique name until Xvfb wins :n, so a racing `up` never clobbers the winner's log.
+		fd, tmp = tempfile.mkstemp(dir=base, suffix='.log')
+		log = os.fdopen(fd, 'w')
+		r, w = os.pipe()
+		# -displayfd: Xvfb writes the display number once it accepts clients, or exits if :n is taken.
+		xvfb = subprocess.Popen(
+			['Xvfb', f':{n}', '-screen', '0', f'{size}x24', '-nolisten', 'tcp', '-displayfd', str(w)],
+			pass_fds=(w,),
+			stdin=subprocess.DEVNULL,
+			stdout=log,
+			stderr=log,
+			start_new_session=True,
+		)
+		os.close(w)
+		ready = select.select([r], [], [], 10)[0] and os.read(r, 16).strip()
+		os.close(r)
+		if ready:
+			os.replace(tmp, f'{base}/{n}.log')
+			break
+		xvfb.kill()
+		xvfb.wait()
+		log.close()
+		with open(tmp) as f:
+			err = (f.read().strip().splitlines() or [err])[-1]
+		os.remove(tmp)
+	else:
+		die(f'Xvfb failed on every display :90-:199: {err}')
+
+	disp, state = f':{n}', {'xvfb': xvfb.pid}
+	os.environ['DISPLAY'] = disp
+	os.environ.pop('SESSION_MANAGER', None)  # keep xfwm4 out of the user's XFCE session
+	if shutil.which('xfwm4'):
+		wm = subprocess.Popen(
+			['xfwm4', f'--display={disp}', '--compositor=off', '--sm-client-disable'],
+			stdin=subprocess.DEVNULL,
+			stdout=log,
+			stderr=log,
+			start_new_session=True,
+		)
+		state['wm'] = wm.pid
+		deadline = time.monotonic() + 5
+		while run('xdotool', 'search', '--class', '^xfwm4$', check=False).returncode:
+			if time.monotonic() > deadline or wm.poll() is not None:
+				print(f'xlab: xfwm4 did not come up, see {base}/{n}.log', file=sys.stderr)
+				break
+			time.sleep(0.05)
+	else:
+		print('xlab: xfwm4 not found, running without a window manager', file=sys.stderr)
+
+	sink = f'xlab_{n}'
+	if not shutil.which('pactl'):
+		print('xlab: pactl not found, no null sink: apps will play to the default output', file=sys.stderr)
+	else:
+		p = run('pactl', 'load-module', 'module-null-sink', f'sink_name={sink}', check=False)
+		if p.returncode:
+			print(f'xlab: no null sink: pactl: {p.stderr.strip()}', file=sys.stderr)
+		else:
+			state |= {'module': p.stdout.strip(), 'sink': sink}
+	with open(f'{base}/{n}.json', 'w') as f:
+		json.dump(state, f)
+	print(f'export DISPLAY={disp}')
+	if 'sink' in state:
+		print(f'export PULSE_SINK={sink}')
+
+
+def load(n):
+	try:
+		with open(f'{state_dir()}/{n}.json') as f:
+			return json.load(f)
+	except FileNotFoundError:
+		return None
+
+
+def stop(n):
+	state = load(n)
+	if state is None:
+		die(f'no xlab state for :{n} (not started by xlab up)')
+	pids = [p for p in (state.get('wm'), state.get('xvfb')) if p and alive(p, n)]
+	for sig in (signal.SIGTERM, signal.SIGKILL):
+		for p in pids:
+			with contextlib.suppress(ProcessLookupError):
+				os.kill(p, sig)
+		deadline = time.monotonic() + 5
+		while (pids := [p for p in pids if alive(p, n)]) and time.monotonic() < deadline:
+			time.sleep(0.05)
+		if not pids:
+			break
+	if 'module' in state and shutil.which('pactl'):
+		run('pactl', 'unload-module', state['module'], check=False)
+	for ext in ('json', 'log'):
+		with contextlib.suppress(FileNotFoundError):
+			os.remove(f'{STATE}/{n}.{ext}')
+
+
+def find(pattern, by='name', timeout=20.0):
+	"""First visible window matching pattern as (id, WxH+X+Y, title); exit 124 on timeout."""
+	need('xdotool', 'xwininfo')
+	deadline = time.monotonic() + timeout
+	while True:
+		r = run('xdotool', 'search', '--onlyvisible', f'--{by}', '--', pattern, check=False)
+		if 'open display' in r.stderr:
+			die(r.stderr.strip())
+		if ids := r.stdout.split():
+			break
+		if time.monotonic() >= deadline:
+			die(f'no visible window with {by} matching {pattern!r} after {timeout:g}s', 124)
+		time.sleep(0.2)
+	wid = int(ids[0])
+	out = run('xwininfo', '-id', str(wid)).stdout
+	v = {k: int(x) for k, x in re.findall(r'^\s+([A-Za-z -]+):\s+(-?\d+)$', out, re.MULTILINE)}
+	title = re.search(r'Window id: \S+ (.*)', out).group(1)
+	title = title[1:-1] if title.startswith('"') else title
+	x, y = v['Absolute upper-left X'], v['Absolute upper-left Y']
+	return f'0x{wid:07x}', f'{v["Width"]}x{v["Height"]}{x:+d}{y:+d}', title
+
+
+def window(spec):
+	return spec if re.fullmatch(r'0x[0-9a-fA-F]+|\d+', spec) else find(spec)[0]
+
+
+def parse_steps(tokens, win):
+	steps, i = [], 0
+	while i < len(tokens):
+		name = tokens[i]
+		if name not in STEPS:
+			die(f'unknown step {name!r} (steps: {STEP_USAGE})', 2)
+		pats = STEPS[name]
+		args = tokens[i + 1 : i + 1 + len(pats)]
+		if len(args) < len(pats) or not all(re.fullmatch(p, a, re.DOTALL) for p, a in zip(pats, args, strict=False)):
+			die(f'bad step: {" ".join([name, *args])} (steps: {STEP_USAGE})', 2)
+		if name == 'focus' and not win:
+			die('focus needs -w WIN', 2)
+		steps.append((name, args))
+		i += 1 + len(pats)
+	if not steps:
+		die('no steps given', 2)
+	return steps
+
+
+def focus(win):
+	try:
+		r = subprocess.run(['xdotool', 'windowactivate', '--sync', win], capture_output=True, timeout=5, check=False)
+		ok = r.returncode == 0
+	except subprocess.TimeoutExpired:
+		ok = False
+	if not ok:
+		run('xdotool', 'windowfocus', win)  # no WM, or it ignored the request: plain X focus
+
+
+def send(win, tokens):
+	steps = parse_steps(tokens, win)
+	need('xdotool')
+	win = win and window(win)
+	for name, a in steps:
+		if name == 'wait':
+			time.sleep(float(a[0]))
+		elif name == 'focus':
+			focus(win)
+		elif name in ('key', 'type'):
+			run('xdotool', name, '--', a[0])
+		else:
+			run('xdotool', 'mousemove', *(['--window', win] if win else []), '--', *a, *BUTTONS[name])
+
+
+def shot(win, crop, scale, path):
+	need('import', 'magick')
+	if crop and not re.fullmatch(r'\d+x\d+\+\d+\+\d+', crop):
+		die(f'--crop wants WxH+X+Y, got {crop!r}', 2)
+	run('import', '-silent', '-window', 'root' if win in (None, 'root') else window(win), path)
+	ops = (['-crop', crop, '+repage'] if crop else []) + (['-resize', str(scale)] if scale else [])
+	if ops:
+		run('magick', path, *ops, path)
+	size = run('magick', 'identify', '-format', '%wx%h', path).stdout
+	print(os.path.abspath(path), size, f'{os.path.getsize(path)}B')
+
+
+def main():
+	common = argparse.ArgumentParser(add_help=False)
+	common.add_argument('-d', '--display', default=argparse.SUPPRESS, help='X display (default $DISPLAY)')
+	ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+	ap.add_argument('-d', '--display', help='X display (default $DISPLAY)')
+	sub = ap.add_subparsers(dest='cmd', required=True)
+	p = sub.add_parser('up', help='start a private display')
+	p.add_argument('size', nargs='?', default='1280x800', help='screen size WxH (default 1280x800)')
+	p = sub.add_parser('down', parents=[common], help='stop what up started')
+	p.add_argument('target', nargs='?', metavar=':N', help='display (default -d or $DISPLAY)')
+	p = sub.add_parser('win', parents=[common], help='wait for a visible window')
+	p.add_argument('pattern')
+	p.add_argument('-t', '--timeout', type=float, default=20.0, help='seconds (default 20)')
+	g = p.add_mutually_exclusive_group()
+	g.add_argument('--class', dest='by', action='store_const', const='class', default='name', help='match class')
+	g.add_argument('--pid', dest='by', action='store_const', const='pid', help='match _NET_WM_PID')
+	p = sub.add_parser('input', parents=[common], help='click, type, press keys')
+	p.add_argument('-w', '--window', help='window id or title PATTERN; coordinates become window-relative')
+	p.add_argument('steps', nargs=argparse.REMAINDER)
+	p = sub.add_parser('shot', parents=[common], help='screenshot to a file')
+	p.add_argument('-w', '--window', help='window id, title PATTERN or root (default root)')
+	p.add_argument('--crop', metavar='WxH+X+Y')
+	p.add_argument('--scale', type=int, metavar='W', help='resize to width W')
+	p.add_argument('file')
+	args = ap.parse_args()
+
+	if args.cmd == 'up':
+		return up(args.size)
+	disp = (args.cmd == 'down' and args.target) or args.display or os.environ.get('DISPLAY')
+	n = display_num(disp)
+	if args.cmd == 'down':
+		stop(n)
+		return print(f'stopped :{n}')
+	if n < 90 and (args.cmd == 'input' or not args.display):
+		what = 'send input to' if args.cmd == 'input' else 'read'
+		die(f'refusing to {what} :{n}, a real display (xlab up gives a private one; reading needs an explicit -d)')
+	os.environ['DISPLAY'] = disp
+	if args.cmd == 'win':
+		print(*find(args.pattern, args.by, args.timeout))
+	elif args.cmd == 'input':
+		send(args.window, args.steps)
+	else:
+		shot(args.window, args.crop, args.scale, args.file)
+
+
+if __name__ == '__main__':
+	main()

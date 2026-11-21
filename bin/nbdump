@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""nbdump: a Jupyter notebook's cells and outputs as plain text.
+
+	nbdump NB.ipynb [CELLS] [--src|--out] [--errors] [-t 3000]
+
+CELLS are 0-based indexes: 3, 2-5, 1,4,7 or a mix. Each cell prints as `=== [i] code exec=N` (or markdown/raw),
+its source, then each output under a `--- stdout|stderr|result|display|error` line: stream text, text/plain,
+`ename: evalue` with the traceback, images as `[image/png 34 KB]`. ANSI colours and overwritten progress-bar
+text are removed; each output is cut to -t chars (head and tail kept). --errors shows only cells that raised,
+after a line of counts. The file is read as plain JSON, so no Jupyter install is needed.
+"""
+
+import argparse
+import json
+import re
+import sys
+
+ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+# Text before a lone \r was overwritten on screen (tqdm, Keras progress bars).
+OVERWRITTEN = re.compile(r'[^\n]*\r(?!\n)')
+KINDS = {'stream': None, 'execute_result': 'result', 'display_data': 'display', 'error': 'error'}
+
+
+def text(v):
+	return ''.join(v) if isinstance(v, list) else v or ''
+
+
+def clean(s):
+	return OVERWRITTEN.sub('', ANSI.sub('', s))
+
+
+def cap(s, n):
+	return s if len(s) <= n else f'{s[: n // 2]}\n… [{len(s) - n} chars cut] …\n{s[-(n - n // 2) :]}'
+
+
+def output(o):
+	"""(header, body) of one cell output."""
+	kind = o.get('output_type')
+	if kind == 'stream':
+		return o.get('name', 'stdout'), clean(text(o.get('text')))
+	if kind == 'error':
+		tb = '\n'.join(clean(text(x)) for x in o.get('traceback') or [])
+		return 'error', f'{o.get("ename")}: {o.get("evalue")}\n{tb}'
+	parts, data = [], o.get('data') or {}
+	for mime, v in data.items():
+		if mime.startswith('image/'):
+			size = len(text(v)) if mime == 'image/svg+xml' else len(text(v).strip()) * 3 // 4
+			parts.append(f'[{mime} {max(1, round(size / 1024))} KB]')
+	if 'text/plain' in data:
+		parts.append(clean(text(data['text/plain'])))
+	elif not parts:
+		parts.append(' '.join(f'[{m} {len(text(v))} chars]' for m, v in data.items()))
+	return KINDS.get(kind, kind), '\n'.join(parts)
+
+
+def cells_arg(s):
+	out = set()
+	for part in s.split(','):
+		m = re.fullmatch(r'(\d+)(?:-(\d+))?', part.strip())
+		if not m:
+			raise argparse.ArgumentTypeError(f'{part!r}: use 3, 2-5 or 1,4,7')
+		out.update(range(int(m[1]), int(m[2] or m[1]) + 1))
+	return out
+
+
+def main():
+	ap = argparse.ArgumentParser(
+		description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter
+	)
+	ap.epilog = __doc__.split('\n', 2)[2]
+	ap.add_argument('nb')
+	ap.add_argument('cells', nargs='?', type=cells_arg)
+	g = ap.add_mutually_exclusive_group()
+	g.add_argument('--src', action='store_true', help='sources only')
+	g.add_argument('--out', action='store_true', help='outputs only')
+	ap.add_argument('--errors', action='store_true', help='only cells that raised')
+	ap.add_argument('-t', type=int, default=3000, help='max chars per output')
+	a = ap.parse_args()
+	try:
+		with open(a.nb, encoding='utf-8') as f:
+			cells = json.load(f).get('cells', [])
+	except (OSError, ValueError, AttributeError) as e:
+		sys.exit(f'nbdump: {a.nb}: {e}')
+	if a.cells and max(a.cells) >= len(cells):
+		sys.exit(f'nbdump: no cell {max(a.cells)}; {a.nb} has {len(cells)} (0-{len(cells) - 1})')
+	failed = {i for i, c in enumerate(cells) if any(o.get('output_type') == 'error' for o in c.get('outputs') or [])}
+	if a.errors:
+		code = [c for c in cells if c.get('cell_type') == 'code']
+		ran = sum(c.get('execution_count') is not None for c in code)
+		print(f'{a.nb}: {len(cells)} cells, {len(code)} code, {ran} executed, {len(failed)} with errors')
+	out = []
+	for i, c in enumerate(cells):
+		kind = c.get('cell_type', '?')
+		if (a.cells and i not in a.cells) or (a.errors and i not in failed) or (a.out and kind != 'code'):
+			continue
+		exe = c.get('execution_count')
+		out.append(f'=== [{i}] {kind}' + (f' exec={"-" if exe is None else exe}' if kind == 'code' else ''))
+		if not a.out:
+			out.append(text(c.get('source')).rstrip('\n'))
+		if not a.src:
+			for o in c.get('outputs') or []:
+				head, body = output(o)
+				out += [f'--- {head}', cap(body.rstrip('\n'), a.t)]
+	try:
+		print('\n'.join(out))
+	except BrokenPipeError:
+		sys.stderr.close()
+
+
+if __name__ == '__main__':
+	main()

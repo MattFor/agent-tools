@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""transcript: search and read past Claude Code, Codex and Copilot CLI sessions.
+
+	transcript sessions [-a AGENT] [-p PROJ] [-n 20]          newest first: date, agent, id, folder, first prompt
+	transcript find TERM... [-r] [--role R] [--since DATE] [-a AGENT] [-p PROJ] [-n 30]
+	                                                           messages containing every TERM (-r: TERMs are regexes)
+	transcript show ID [--role R] [--grep RE] [-w 400]         one session as a readable log
+	transcript tools ID [--name NAME] [--grep RE] [--full]     its tool calls with their inputs
+
+ID is a session id or a unique prefix of one. Roles: user, assistant, tool (a call), result (its output).
+AGENT: claude, codex, copilot. PROJ matches the session's folder (substring). The calling Claude Code session
+is left out of find (--self keeps it). Locations follow CLAUDE_CONFIG_DIR, CODEX_HOME and COPILOT_HOME.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HOME = os.path.expanduser('~')
+CLAUDE = os.environ.get('CLAUDE_CONFIG_DIR') or f'{HOME}/.claude'
+CODEX = os.environ.get('CODEX_HOME') or f'{HOME}/.codex'
+COPILOT = os.environ.get('COPILOT_HOME') or f'{HOME}/.copilot'
+ROOTS = {'claude': f'{CLAUDE}/projects', 'codex': f'{CODEX}/sessions', 'copilot': f'{COPILOT}/session-state'}
+UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+NOISE = ('<system-reminder>', '<local-command-', '<task-notification>')
+
+
+def files(agent=None):
+	"""Yield (agent, session id, path) for every transcript file, newest first."""
+	out = []
+	for a, root in ROOTS.items():
+		if agent and a != agent:
+			continue
+		pat = {'claude': '**/*.jsonl', 'codex': '**/rollout-*.jsonl', 'copilot': '*/events.jsonl'}[a]
+		for p in glob.glob(f'{root}/{pat}', recursive=True):
+			# Claude subagents live in <session>/subagents/; they count as part of that session.
+			ids = UUID.findall(p)
+			if a == 'claude' and ids and '/memory/' not in p:
+				out.append((a, ids[0], p))
+			elif a != 'claude' and ids:
+				out.append((a, ids[-1] if a == 'codex' else ids[0], p))
+	out.sort(key=lambda x: os.path.getmtime(x[2]), reverse=True)
+	return out
+
+
+def text_of(c):
+	if isinstance(c, str):
+		return c
+	if isinstance(c, list):
+		return '\n'.join(text_of(x.get('text', x.get('content', ''))) if isinstance(x, dict) else str(x) for x in c)
+	if isinstance(c, dict):
+		return text_of(c.get('content', c.get('text', '')))
+	return '' if c is None else str(c)
+
+
+def events(agent, path):
+	"""Yield dicts: t (ISO time), role, text, and for tool calls name + input. 'cwd' events carry the folder."""
+	parse, last = (claude_ev if agent == 'claude' else codex_ev if agent == 'codex' else copilot_ev), ''
+	with open(path, errors='replace') as f:
+		for line in f:
+			try:
+				d = json.loads(line)
+			except ValueError:
+				continue
+			if not isinstance(d, dict):
+				continue
+			for e in parse(d):
+				# Some records (summaries, replays) carry no time: they belong where they sit.
+				last = e['t'] = e['t'] or last
+				yield e
+
+
+def claude_ev(d):
+	t, msg = d.get('timestamp', ''), d.get('message') or {}
+	if d.get('cwd'):
+		yield {'t': t, 'role': 'cwd', 'text': d['cwd']}
+	role, content = msg.get('role'), msg.get('content')
+	if role == 'user' and not d.get('isMeta'):
+		if isinstance(content, str):
+			content = [{'type': 'text', 'text': content}]
+		for c in content or []:
+			# Injected context (CLAUDE.md, memory, hook output), not something the user typed.
+			if isinstance(c, dict) and c.get('type') == 'text' and not c.get('text', '').startswith(NOISE):
+				yield {'t': t, 'role': 'user', 'text': c.get('text', '')}
+			elif isinstance(c, dict) and c.get('type') == 'tool_result':
+				yield {'t': t, 'role': 'result', 'text': text_of(c.get('content'))}
+	elif role == 'assistant':
+		for c in content or []:
+			if not isinstance(c, dict):
+				continue
+			if c.get('type') == 'text':
+				yield {'t': t, 'role': 'assistant', 'text': c.get('text', '')}
+			elif c.get('type') == 'tool_use':
+				yield {'t': t, 'role': 'tool', 'name': c.get('name'), 'input': c.get('input') or {}}
+
+
+def codex_ev(d):
+	t, p = d.get('timestamp', ''), d.get('payload') or {}
+	kind = p.get('type')
+	if d.get('type') == 'session_meta' and p.get('cwd'):
+		yield {'t': t, 'role': 'cwd', 'text': p['cwd']}
+	elif d.get('type') != 'response_item':
+		return
+	elif kind == 'message' and p.get('role') in ('user', 'assistant'):
+		text = text_of(p.get('content'))
+		# Codex sends AGENTS.md, environment and skill blocks as user messages.
+		if p['role'] == 'assistant' or not text.lstrip().startswith(('<', '# AGENTS.md')):
+			yield {'t': t, 'role': p['role'], 'text': text}
+	elif kind in ('function_call', 'custom_tool_call', 'local_shell_call'):
+		inp = p.get('input') or p.get('arguments') or p.get('action') or ''
+		if isinstance(inp, str):
+			try:
+				inp = json.loads(inp)
+			except ValueError:
+				inp = {'input': inp}
+		yield {'t': t, 'role': 'tool', 'name': p.get('name') or kind, 'input': inp}
+	elif kind and kind.endswith('_output'):
+		yield {'t': t, 'role': 'result', 'text': text_of(p.get('output'))}
+
+
+def copilot_ev(d):
+	t, data, kind = d.get('timestamp', ''), d.get('data') or {}, d.get('type')
+	if kind == 'session.start':
+		yield {'t': t, 'role': 'cwd', 'text': (data.get('context') or {}).get('cwd', '')}
+	elif kind == 'user.message':
+		yield {'t': t, 'role': 'user', 'text': text_of(data.get('content'))}
+	elif kind == 'assistant.message' and data.get('content'):
+		yield {'t': t, 'role': 'assistant', 'text': text_of(data['content'])}
+	elif kind == 'tool.execution_start':
+		yield {'t': t, 'role': 'tool', 'name': data.get('toolName'), 'input': data.get('arguments') or {}}
+	elif kind == 'tool.execution_complete':
+		yield {'t': t, 'role': 'result', 'text': text_of((data.get('result') or {}).get('content'))}
+
+
+def tool_line(e):
+	i = e['input'] if isinstance(e['input'], dict) else {'input': e['input']}
+	main = i.get('command') or i.get('cmd') or i.get('file_path') or i.get('path') or i.get('input') or i
+	return main if isinstance(main, str) else json.dumps(main, ensure_ascii=False)
+
+
+def body(e):
+	return f'[{e["name"]}] {tool_line(e)}' if e['role'] == 'tool' else e['text']
+
+
+def one_line(s, width):
+	s = s.replace('\n', ' ⏎ ')
+	return s if len(s) <= width else s[: width - 1] + '…'
+
+
+def session_info(agent, path):
+	cwd, first, start = '', '', ''
+	for e in events(agent, path):
+		start = start or e['t']
+		if e['role'] == 'cwd' and not cwd:
+			cwd = e['text']
+		elif e['role'] == 'user' and not first and not e['text'].lstrip().startswith('<'):
+			first = e['text']
+		if cwd and first:
+			break
+	return start, cwd.replace(HOME, '~', 1), first
+
+
+def resolve(prefix):
+	hits = [f for f in files() if f[1].startswith(prefix)]
+	ids = {f[1] for f in hits}
+	if not ids:
+		sys.exit(f'transcript: no session starts with {prefix}')
+	if len(ids) > 1:
+		sys.exit(f'transcript: {prefix} matches {len(ids)} sessions: {" ".join(sorted(i[:12] for i in ids))}')
+	# Main transcript first, then its subagents.
+	return sorted(hits, key=lambda f: ('/subagents/' in f[2], f[2]))
+
+
+def candidates(terms, regex, agent):
+	"""Files that can contain the first plain term (grep -l is far faster than parsing every line)."""
+	all_files = files(agent)
+	if regex or not terms or not shutil.which('grep'):
+		return all_files
+	roots = [r for a, r in ROOTS.items() if (not agent or a == agent) and os.path.isdir(r)]
+	if not roots:
+		return []
+	r = subprocess.run(
+		['grep', '-rlFi', '--include=*.jsonl', terms[0], *roots], capture_output=True, text=True, check=False
+	)
+	keep = set(r.stdout.splitlines())
+	return [f for f in all_files if f[2] in keep]
+
+
+def cmd_find(a):
+	pats = [re.compile(t if a.regex else re.escape(t), re.IGNORECASE) for t in a.terms]
+	me = '' if a.self else os.environ.get('CLAUDE_CODE_SESSION_ID', '')
+	shown, seen = 0, set()
+	for agent, sid, path in candidates(a.terms, a.regex, a.agent):
+		if (me and sid == me) or (a.since and os.path.getmtime(path) < a.since_ts):
+			continue
+		info = None
+		for e in events(agent, path):
+			if e['role'] == 'cwd' or (a.role and e['role'] != a.role) or (a.since and e['t'] < a.since):
+				continue
+			s = body(e)
+			if not all(p.search(s) for p in pats) or (sid, e['role'], s) in seen:
+				continue
+			seen.add((sid, e['role'], s))
+			info = info or session_info(agent, path)
+			if a.proj and a.proj.lower() not in info[1].lower():
+				break
+			m = pats[0].search(s)
+			lo = max(0, m.start() - a.width // 3) if m else 0
+			sub = ' sub' if '/subagents/' in path else ''
+			print(f'{e["t"][:16].replace("T", " ")}  {agent:7} {sid[:8]}{sub}  {info[1]}  {e["role"]}: ', end='')
+			print(('…' if lo else '') + one_line(s[lo:], a.width))
+			shown += 1
+			if shown >= a.n:
+				return
+	if not shown:
+		print('no matches', file=sys.stderr)
+		sys.exit(1)
+
+
+def cmd_sessions(a):
+	seen, shown = set(), 0
+	for agent, sid, path in files(a.agent):
+		if sid in seen or '/subagents/' in path:
+			continue
+		seen.add(sid)
+		start, cwd, first = session_info(agent, path)
+		if a.proj and a.proj.lower() not in cwd.lower():
+			continue
+		print(f'{start[:16].replace("T", " ")}  {agent:7} {sid[:8]}  {cwd}  {one_line(first, 100)}')
+		shown += 1
+		if shown >= a.n:
+			break
+
+
+def cmd_show(a):
+	rx = re.compile(a.grep, re.IGNORECASE) if a.grep else None
+	for agent, _sid, path in resolve(a.id):
+		if '/subagents/' in path:
+			print(f'--- subagent {os.path.basename(path)}')
+		prev = None
+		for e in events(agent, path):
+			if e['role'] == 'cwd' or (a.role and e['role'] != a.role):
+				continue
+			s = body(e)
+			# Claude Code sometimes records the same message twice in a row.
+			if (rx and not rx.search(s)) or (e['role'], s) == prev:
+				continue
+			prev = (e['role'], s)
+			print(f'{e["t"][11:19]} {e["role"]:9} {one_line(s, a.width)}')
+
+
+def cmd_tools(a):
+	rx = re.compile(a.grep, re.IGNORECASE) if a.grep else None
+	for agent, _sid, path in resolve(a.id):
+		for e in events(agent, path):
+			if e['role'] != 'tool' or (a.name and (e['name'] or '').lower() != a.name.lower()):
+				continue
+			s = tool_line(e) if not a.full else json.dumps(e['input'], ensure_ascii=False, indent=1)
+			if rx and not rx.search(s):
+				continue
+			if a.full:
+				print(f'=== {e["t"][:19]} {e["name"]}')
+				inp = e['input'] if isinstance(e['input'], dict) else {}
+				# Commands and file contents print raw so they can be copied as they were.
+				for k in ('command', 'cmd', 'content', 'old_string', 'new_string'):
+					if isinstance(inp.get(k), str):
+						print(f'--- {k}\n{inp[k]}')
+				if not any(isinstance(inp.get(k), str) for k in ('command', 'cmd', 'content')):
+					print(s)
+			else:
+				print(f'{e["t"][11:19]} {e["name"]:12} {one_line(s, 300)}')
+
+
+def main():
+	ap = argparse.ArgumentParser(
+		description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter
+	)
+	ap.epilog = __doc__.split('\n', 2)[2]
+	sp = ap.add_subparsers(dest='cmd', required=True)
+	agents = ['claude', 'codex', 'copilot']
+	p = sp.add_parser('sessions')
+	p.add_argument('-a', '--agent', choices=agents)
+	p.add_argument('-p', '--proj')
+	p.add_argument('-n', type=int, default=20)
+	p = sp.add_parser('find')
+	p.add_argument('terms', nargs='+')
+	p.add_argument('-r', '--regex', action='store_true')
+	p.add_argument('--role', choices=['user', 'assistant', 'tool', 'result'])
+	p.add_argument('--since', help='YYYY-MM-DD')
+	p.add_argument('-a', '--agent', choices=agents)
+	p.add_argument('-p', '--proj')
+	p.add_argument('-n', type=int, default=30)
+	p.add_argument('-w', '--width', type=int, default=200)
+	p.add_argument('--self', action='store_true')
+	p = sp.add_parser('show')
+	p.add_argument('id')
+	p.add_argument('--role', choices=['user', 'assistant', 'tool', 'result'])
+	p.add_argument('--grep')
+	p.add_argument('-w', '--width', type=int, default=400)
+	p = sp.add_parser('tools')
+	p.add_argument('id')
+	p.add_argument('--name')
+	p.add_argument('--grep')
+	p.add_argument('--full', action='store_true')
+	a = ap.parse_args()
+	if getattr(a, 'since', None):
+		import datetime
+
+		a.since_ts = datetime.datetime.fromisoformat(a.since).timestamp()
+	try:
+		{'sessions': cmd_sessions, 'find': cmd_find, 'show': cmd_show, 'tools': cmd_tools}[a.cmd](a)
+	except BrokenPipeError:
+		sys.stderr.close()
+
+
+if __name__ == '__main__':
+	main()

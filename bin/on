@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""on: run commands and copy files on your other machines, one way for every host.
+
+	on HOST [-t SECS] [-d] CMD...      run CMD there (one shell string); stdin and the exit code pass through
+	on HOST put SRC... DEST            copy files/folders there (tar over the same connection), print their sha256
+	on HOST get SRC... DEST            copy from there into local DEST
+	on all|H1,H2 [-t SECS] CMD...      run on several at once; every line prefixed "host: "
+	on -l                              list hosts
+
+-d imports DISPLAY, DBUS_SESSION_BUS_ADDRESS and XAUTHORITY from the host's desktop session first. A host that
+is this machine runs locally. Hosts come from $ON_HOSTS or ~/.config/on/hosts, one per line:
+
+	pc,desktop    ssh -o BatchMode=yes -o ConnectTimeout=15 me@desktop
+	phone         ssh -o BatchMode=yes -p 8022 "$(tailscale ip -4 phone)"
+
+Names (comma-separated aliases) first, then a shell command prefix that takes the remote command as its last
+argument; it is run by sh, so $(...) is resolved at call time. A name equal to `uname -n` marks this machine.
+"""
+
+import hashlib
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import threading
+
+# Exports the first desktop session's display variables, whatever the desktop.
+DESKTOP_ENV = (
+	'for p in $(pgrep -u "$(id -u)"); do '
+	'e=$(tr "\\0" "\\n" < /proc/$p/environ 2>/dev/null | grep -E "^(DISPLAY|DBUS_SESSION_BUS_ADDRESS|XAUTHORITY)=") '
+	'&& echo "$e" | grep -q ^DISPLAY= && break; done; '
+	'while IFS= read -r kv; do [ -n "$kv" ] && export "$kv"; done <<ON_EOF\n$e\nON_EOF\n'
+)
+
+
+def hosts():
+	path = os.environ.get('ON_HOSTS') or os.path.expanduser('~/.config/on/hosts')
+	try:
+		with open(path) as f:
+			lines = [x.strip() for x in f]
+	except OSError:
+		sys.exit(f'on: no host list at {path} (see on -h)')
+	me = socket.gethostname().split('.')[0].lower()
+	out = {}
+	for line in lines:
+		if not line or line.startswith('#'):
+			continue
+		names, _, prefix = line.partition(' ')
+		names = [n.lower() for n in names.split(',')]
+		h = {'name': names[0], 'prefix': prefix.strip(), 'local': me in names}
+		for n in names:
+			out[n] = h
+	return out
+
+
+def argv(h, cmd):
+	if h['local']:
+		return ['sh', '-c', cmd]
+	return ['sh', '-c', h['prefix'] + ' "$1"', 'on', cmd]
+
+
+def remote_path(p):
+	"""Quote a path for the remote shell, keeping ~/ meaning the remote home."""
+	if p == '~':
+		return '"$HOME"'
+	return '"$HOME"/' + shlex.quote(p[2:]) if p.startswith('~/') else shlex.quote(p)
+
+
+def run(h, cmd, timeout, stdin=None, capture=False):
+	try:
+		return subprocess.run(
+			argv(h, cmd), stdin=stdin, capture_output=capture, text=capture, timeout=timeout, check=False
+		)
+	except subprocess.TimeoutExpired:
+		print(f'on: {h["name"]}: timed out after {timeout}s', file=sys.stderr)
+		return subprocess.CompletedProcess([], 124, '', '')
+
+
+def put(h, srcs, dest, timeout):
+	missing = [s for s in srcs if not os.path.exists(s)]
+	if missing:
+		sys.exit(f'on: not found: {" ".join(missing)}')
+	tar = ['tar', '-cf', '-']
+	for s in map(os.path.abspath, srcs):
+		tar += ['-C', os.path.dirname(s), os.path.basename(s)]
+	names = ' '.join(shlex.quote(os.path.basename(os.path.abspath(s))) for s in srcs)
+	d = remote_path(dest)
+	# Files get a sha256 to compare with the local one; folders a file count.
+	cmd = (
+		f'mkdir -p {d} && tar -xf - -C {d} && cd {d} && for f in {names}; do '
+		'if [ -d "$f" ]; then echo "$f/ $(find "$f" -type f | wc -l) files"; else sha256sum "$f"; fi; done'
+	)
+	with subprocess.Popen(tar, stdout=subprocess.PIPE) as t:
+		r = run(h, cmd, timeout, stdin=t.stdout, capture=True)
+	sys.stderr.write(r.stderr or '')
+	for line in (r.stdout or '').splitlines():
+		parts = line.split()
+		if len(parts) == 2 and len(parts[0]) == 64:
+			local = next((s for s in srcs if os.path.basename(os.path.abspath(s)) == parts[1]), None)
+			with open(local or os.devnull, 'rb') as f:
+				ok = local and hashlib.sha256(f.read()).hexdigest() == parts[0]
+			print(f'{parts[1]}  {parts[0][:16]}  {"same as local" if ok else "DIFFERS FROM LOCAL"}')
+		else:
+			print(line)
+	return r.returncode or t.returncode
+
+
+def get(h, srcs, dest, timeout):
+	os.makedirs(dest, exist_ok=True)
+	parts = ' '.join(
+		f'-C {remote_path(os.path.dirname(s) or ".")} {shlex.quote(os.path.basename(s.rstrip("/")))}' for s in srcs
+	)
+	with subprocess.Popen(['tar', '-xvf', '-', '-C', dest], stdin=subprocess.PIPE) as t:
+		try:
+			p = subprocess.run(argv(h, f'tar -cf - {parts}'), stdout=t.stdin, timeout=timeout, check=False)
+		except subprocess.TimeoutExpired:
+			print(f'on: {h["name"]}: timed out after {timeout}s', file=sys.stderr)
+			return 124
+		finally:
+			t.stdin.close()
+	return p.returncode or t.returncode
+
+
+def many(targets, cmd, timeout):
+	lock, codes = threading.Lock(), {}
+
+	def one(h):
+		r = run(h, cmd, timeout, stdin=subprocess.DEVNULL, capture=True)
+		codes[h['name']] = r.returncode
+		with lock:
+			for line in (r.stdout + r.stderr).splitlines():
+				print(f'{h["name"]}: {line}')
+			if r.returncode:
+				# ssh exits 255 when it never reached the host.
+				print(f'{h["name"]}: {"unreachable" if r.returncode == 255 else f"exit {r.returncode}"}')
+
+	threads = [threading.Thread(target=one, args=(h,)) for h in targets]
+	for t in threads:
+		t.start()
+	for t in threads:
+		t.join()
+	return max(codes.values(), default=0)
+
+
+def main():
+	args = sys.argv[1:]
+	if not args or args[0] in ('-h', '--help'):
+		print(__doc__)
+		return 0 if args else 2
+	hs = hosts()
+	if args[0] == '-l':
+		for h in {id(h): h for h in hs.values()}.values():
+			names = ','.join(n for n, v in hs.items() if v is h)
+			print(f'{names:24} {"(this machine)" if h["local"] else h["prefix"]}')
+		return 0
+	target, args = args[0].lower(), args[1:]
+	timeout, desktop = None, False
+	while args and args[0] in ('-t', '-d'):
+		if args[0] == '-t' and len(args) > 1:
+			timeout, args = float(args[1]), args[2:]
+		elif args[0] == '-d':
+			desktop, args = True, args[1:]
+		else:
+			break
+	if target == 'all':
+		targets = list({id(h): h for h in hs.values()}.values())
+	else:
+		unknown = [n for n in target.split(',') if n not in hs]
+		if unknown:
+			sys.exit(f'on: unknown host {" ".join(unknown)} (on -l lists them)')
+		targets = list({id(hs[n]): hs[n] for n in target.split(',')}.values())
+	if not args:
+		sys.exit('on: no command')
+	if args[0] in ('put', 'get') and len(targets) == 1 and len(args) >= 3:
+		return (put if args[0] == 'put' else get)(targets[0], args[1:-1], args[-1], timeout)
+	cmd = ' '.join(args)
+	if desktop:
+		cmd = DESKTOP_ENV + cmd
+	if len(targets) > 1:
+		return many(targets, cmd, timeout)
+	return run(targets[0], cmd, timeout).returncode
+
+
+if __name__ == '__main__':
+	sys.exit(main())
