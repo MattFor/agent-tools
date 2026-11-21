@@ -127,6 +127,8 @@ async function main() {
     profile = fs.mkdtempSync('/tmp/webshot-');
     const args = [
         '--headless',
+        // As Playwright does: distros that block unprivileged user namespaces (Ubuntu 24.04) crash the sandbox.
+        '--no-sandbox',
         '--remote-debugging-port=0',
         `--user-data-dir=${profile}`,
         '--hide-scrollbars',
