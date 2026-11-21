@@ -7,7 +7,7 @@
 	waitfor ... gone PID|PATTERN                   until it no longer exists
 	waitfor ... log FILE REGEX                     until a line matching REGEX appears (lines already there count)
 	waitfor ... file PATH                          until it exists and is non-empty
-	waitfor ... ci [-R OWNER/REPO] [SHA]           GitHub Actions runs for SHA (default HEAD): wait for all to finish,
+	waitfor ... ci [-R OWNER/REPO] [SHA]           GitHub Actions runs for SHA (default HEAD, or the newest commit of -R): wait for all to finish,
 	                                               print "CONCLUSION URL WORKFLOW" per run, failed logs' tails
 	waitfor ... -- CMD...                          until CMD exits 0
 
@@ -176,11 +176,18 @@ def gh(args, repo):
 
 def ci(a):
 	sha = a.sha or 'HEAD'
-	r = subprocess.run(['git', 'rev-parse', sha], capture_output=True, text=True, check=False)
-	if r.returncode == 0:
-		sha = r.stdout.strip()
-	elif not a.sha:
-		die(f'git rev-parse HEAD: {r.stderr.strip()}')
+	if a.repo and not a.sha:
+		# Another repo than the one we stand in: its newest commit on the default branch.
+		code, out, err = gh(['api', f'repos/{a.repo}/commits/HEAD', '--jq', '.sha'], None)
+		if code:
+			die(f'gh api repos/{a.repo}/commits/HEAD: {err.strip()}')
+		sha = out.strip()
+	else:
+		r = subprocess.run(['git', 'rev-parse', sha], capture_output=True, text=True, check=False)
+		if r.returncode == 0:
+			sha = r.stdout.strip()
+		elif not a.sha:
+			die(f'git rev-parse HEAD: {r.stderr.strip()}')
 	runs, first = [], True
 	fields = 'databaseId,status,conclusion,url,workflowName'
 
