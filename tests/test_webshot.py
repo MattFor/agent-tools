@@ -18,7 +18,7 @@ PAGE = """<!doctype html><title>t</title>
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
-	def log_message(self, *args):
+	def log_message(self, format, *args):
 		pass
 
 

@@ -19,6 +19,15 @@ Use these instead of writing the same heredoc, loop or ssh line again. Each has 
   `xlab shot -w PATTERN --crop WxH+X+Y out.png`, `xlab down`.
 - **Web pages**: `webshot URL out.png [--size WxH] [--full] [--mobile] [--dark] [--click CSS] [--wait-for CSS]`,
   `webshot URL --eval 'JS'`; always reports status, console errors and page exceptions.
+- **Lint and test a repo**: `check [--fix] [--only lint|test]` finds the toolchains (Rust, Python, JS, shell,
+  C/C++, Lua, workflows) and runs their format, lint and test steps: one `ok`/`FAIL`/`skip` line each, failure
+  tails shown. Not a hand-chained `fmt && clippy && test | tail`.
+- **Disk space**: `reclaim [PATH]` ranks regenerable space (build dirs, venvs, caches, trash, old downloads)
+  with the command that frees each; it never deletes.
+- **Bot pull requests**: `gh-dependabot [--owner OWNER | REPO…] [--merge]` lists Dependabot/Renovate PRs with
+  check state; `--merge` merges only the green, mergeable ones (only when the user asked for merging).
+- **GitHub vs Codeberg mirrors**: `forge-diff [--owner OWNER | REPO…] --tea-login NAME` reports missing repos,
+  stale branches, tags, visibility, description and topic differences.
 - **JSON**: `jshape FILE` (or stdin) for the structure, then `jq` (`gh … --jq`) for the values; `jshape --paths`
   for greppable `.a.b[3] = v` lines. Never `python3 -c 'import json…'` to pick a field.
 - **Notebooks**: `nbdump NB.ipynb [CELLS] [--errors]`.

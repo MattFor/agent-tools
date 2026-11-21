@@ -55,6 +55,7 @@ class EndToEnd(unittest.TestCase):
 		self.assertGreaterEqual(int(disp[1:]), 90)
 		self.assertTrue(xvfb_running(disp))
 
+		assert APP is not None  # the class is skipped without one
 		args, quit_key = APPS[APP]
 		app = subprocess.Popen([APP, '-title', 'xlab-test', *args], env=env, stderr=subprocess.DEVNULL)
 		self.addCleanup(app.kill)
@@ -62,7 +63,9 @@ class EndToEnd(unittest.TestCase):
 		self.assertEqual(r.returncode, 0, r.stderr)
 		wid, geom, title = r.stdout.split(maxsplit=2)
 		self.assertEqual(title.strip(), 'xlab-test')
-		x, y = map(int, re.fullmatch(r'\d+x\d+([+-]\d+)([+-]\d+)', geom).groups())
+		m = re.fullmatch(r'\d+x\d+([+-]\d+)([+-]\d+)', geom)
+		assert m, geom
+		x, y = map(int, m.groups())
 
 		r = xlab('input', '-d', disp, '-w', wid, 'click', '5', '6')
 		self.assertEqual(r.returncode, 0, r.stderr)

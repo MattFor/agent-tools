@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""check: run a repo's format, lint and test steps and print one line per step.
+
+	check [DIR] [--fix] [--only lint|test] [-v]
+
+DIR defaults to the git toplevel of the cwd (else the cwd). Toolchains come from marker files in DIR:
+Cargo.toml (cargo fmt, clippy, test), Python (ruff, basedpyright when configured, pytest or unittest),
+package.json (its lint/typecheck/test scripts via the lockfile's package manager, local prettier),
+shell scripts (shellcheck, shfmt -d), .clang-format (clang-format), stylua.toml, .github/workflows (actionlint).
+Tools are looked up on PATH, then in nvim's mason bin, then via uvx (ruff, basedpyright only); a missing tool is a skipped step.
+
+Steps run one after another under nice, from DIR: "ok   NAME  (1.2s)", "FAIL NAME  (1.2s)" plus the last 30 lines of
+its output, "skip NAME  (why)". -v prints every step's full output. --fix runs the fixing variants of formatters and
+linters instead of their checks. --only keeps the lint steps (formats, linters, type checks) or the test steps.
+Exit 0 when nothing failed, 1 when a step failed, 2 on usage errors.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+
+MASON = os.path.expanduser('~/.local/share/nvim/mason/bin')
+LOCKS = (('bun.lock', 'bun'), ('bun.lockb', 'bun'), ('pnpm-lock.yaml', 'pnpm'), ('yarn.lock', 'yarn'))
+C_EXT = ('.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx')
+SHEBANG = re.compile(rb'#!\s*(?:\S*/)?(?:env\s+(?:-S\s+)?)?(?:ba)?sh\b')
+
+
+def find(tool):
+	"""argv prefix that runs tool: PATH, then mason's bin, then uvx for the Python tools; None if absent."""
+	if path := shutil.which(tool) or shutil.which(tool, path=MASON):
+		return [path]
+	return ['uvx', tool] if tool in ('ruff', 'basedpyright') and shutil.which('uvx') else None
+
+
+def step(tool, args, kind='lint', fix=None, files=(), name=None):
+	return {'tool': tool, 'args': args, 'kind': kind, 'fix': fix, 'files': files, 'name': name}
+
+
+def load(path, parse):
+	try:
+		with open(path, 'rb') as f:
+			return parse(f)
+	except (OSError, ValueError):
+		return {}
+
+
+def listing():
+	"""Files git tracks or would track (not ignored); without git, a walk that skips hidden dirs, deps and venvs."""
+	try:
+		r = subprocess.run(
+			['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], capture_output=True, check=False
+		)
+	except OSError:
+		r = None
+	if r and r.returncode == 0:
+		names = os.fsdecode(r.stdout).split('\0')
+	else:
+		names = []
+		for root, dirs, fs in os.walk('.'):
+			dirs[:] = [
+				d
+				for d in dirs
+				if not d.startswith('.')
+				and d not in ('node_modules', 'target', '__pycache__')
+				and not os.path.exists(os.path.join(root, d, 'pyvenv.cfg'))
+			]
+			names += [os.path.relpath(os.path.join(root, f)) for f in fs]
+	return [n for n in names if n and os.path.isfile(n)]
+
+
+def is_shell(path):
+	if path.endswith('.sh'):
+		return True
+	try:
+		with open(path, 'rb') as f:
+			return bool(SHEBANG.match(f.read(128)))
+	except OSError:
+		return False
+
+
+def pytest_ready(pyproject):
+	conf = 'pytest' in pyproject.get('tool', {}) or any(
+		os.path.exists(p) for p in ('pytest.ini', 'conftest.py', 'tests/conftest.py')
+	)
+	if not conf:
+		return False
+	try:
+		return subprocess.run(['python3', '-c', 'import pytest'], capture_output=True, check=False).returncode == 0
+	except OSError:
+		return False
+
+
+def plan():
+	"""The steps for the toolchains whose markers sit in the cwd."""
+	steps, files = [], listing()
+	if os.path.isfile('Cargo.toml'):
+		steps += [
+			step('cargo', ['fmt', '--check'], fix=['fmt']),
+			step('cargo', ['clippy', '--all-targets', '--', '-D', 'warnings']),
+			step('cargo', ['test'], 'test'),
+		]
+	pyproject = load('pyproject.toml', tomllib.load)
+	tool = pyproject.get('tool', {})
+	if any(os.path.exists(m) for m in ('pyproject.toml', 'ruff.toml', 'setup.py')) or any(
+		f.endswith('.py') for f in files
+	):
+		steps += [
+			step('ruff', ['check'], fix=['check', '--fix']),
+			step('ruff', ['format', '--check'], fix=['format']),
+		]
+		if os.path.exists('pyrightconfig.json') or 'basedpyright' in tool or 'pyright' in tool:
+			steps.append(step('basedpyright', []))
+		if pytest_ready(pyproject):
+			steps.append(step('python3', ['-m', 'pytest', '-q'], 'test', name='pytest -q'))
+		elif os.path.isdir('tests'):
+			steps.append(step('python3', ['-m', 'unittest', 'discover', '-s', 'tests'], 'test'))
+	pkg = load('package.json', json.load)
+	if pkg:
+		scripts = pkg.get('scripts') or {}
+		pm = next((m for f, m in LOCKS if os.path.exists(f)), 'npm')
+		for script, kind in (('lint', 'lint'), ('typecheck', 'lint'), ('test', 'test')):
+			# npm init's placeholder test script always fails.
+			if script in scripts and 'no test specified' not in scripts[script]:
+				steps.append(step(pm, ['run', script], kind))
+		if glob.glob('.prettierrc*') or glob.glob('prettier.config.*') or 'prettier' in pkg:
+			steps.append(step('node_modules/.bin/prettier', ['--check', '.'], fix=['--write', '.']))
+	shell = [f for f in files if is_shell(f)]
+	if shell:
+		steps += [step('shellcheck', [], files=shell), step('shfmt', ['-d'], fix=['-w'], files=shell)]
+	if os.path.exists('.clang-format') and (sources := [f for f in files if f.endswith(C_EXT)]):
+		steps.append(step('clang-format', ['--dry-run', '--Werror'], fix=['-i'], files=sources))
+	if os.path.exists('stylua.toml') or os.path.exists('.stylua.toml'):
+		steps.append(step('stylua', ['--check', '.'], fix=['.']))
+	if glob.glob('.github/workflows/*.y*ml'):
+		steps.append(step('actionlint', []))
+	return steps
+
+
+def toplevel():
+	try:
+		r = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True, check=False)
+	except OSError:
+		return os.getcwd()
+	return r.stdout.strip() if r.returncode == 0 else os.getcwd()
+
+
+def main():
+	ap = argparse.ArgumentParser(
+		description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter
+	)
+	ap.epilog = __doc__.split('\n', 2)[2]
+	ap.add_argument('dir', nargs='?', metavar='DIR', help='default: git toplevel of the cwd, else the cwd')
+	ap.add_argument('--fix', action='store_true', help='run the fixing variants of formatters and linters')
+	ap.add_argument('--only', choices=('lint', 'test'), help='run only the lint or only the test steps')
+	ap.add_argument('-v', '--verbose', action='store_true', help="print every step's full output")
+	a = ap.parse_args()
+	root = a.dir or toplevel()
+	try:
+		os.chdir(root)
+	except OSError as e:
+		ap.error(f'{root}: {e.strerror}')
+	os.nice(10)
+	steps = [s for s in plan() if a.only in (None, s['kind'])]
+	if not steps:
+		print(f'check: nothing to check in {root}')
+	failed = False
+	for s in steps:
+		args = s['fix'] if a.fix and s['fix'] is not None else s['args']
+		name = s['name'] or shlex.join([os.path.basename(s['tool']), *args])
+		prefix = find(s['tool'])
+		if prefix is None:
+			print(f'skip {name}  (not installed)', flush=True)
+			continue
+		start = time.monotonic()
+		try:
+			r = subprocess.run(
+				[*prefix, *args, *s['files']],
+				stdin=subprocess.DEVNULL,
+				stdout=subprocess.PIPE,
+				stderr=subprocess.STDOUT,
+				text=True,
+				errors='replace',
+				check=False,
+			)
+			code, out = r.returncode, r.stdout
+		except OSError as e:
+			code, out = 1, str(e)
+		took = time.monotonic() - start
+		failed |= code != 0
+		print(f'{"ok" if code == 0 else "FAIL":<5}{name}  ({took:.1f}s)')
+		lines = out.rstrip().split('\n') if out.strip() else []
+		if not a.verbose:
+			lines = lines[-30:] if code else []
+		for line in lines:
+			print(f'    {line}'.rstrip())
+		sys.stdout.flush()
+	sys.exit(1 if failed else 0)
+
+
+if __name__ == '__main__':
+	main()

@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""forge-diff: check that GitHub repos are mirrored on Codeberg (or another Forgejo/Gitea host); read-only.
+
+	forge-diff [OWNER/REPO...] [--owner OWNER] [--codeberg-owner NAME] [--tea-login NAME] [--host codeberg.org]
+
+Repos: the ones given, plus every non-archived, non-fork repo of the GitHub --owner; none given = the repo of the
+current folder. The Codeberg owner defaults to the GitHub one. Per repo it compares existence, visibility, archived,
+default branch, description, topics, every branch head and every tag (name and commit). Output, one block per repo:
+
+	ok    OWNER/REPO
+	DIFF  OWNER/REPO
+	    branch master: github 1a2b3c4 codeberg 9f8e7d6
+	    missing on codeberg | topics: github [a b] codeberg [a] | description differs | visibility: github private codeberg public
+
+GitHub is read with gh. The host is read with tea (--tea-login, or $FORGE_DIFF_TEA_LOGIN), else over HTTPS with
+"Authorization: token $CODEBERG_TOKEN", else anonymously, which cannot see private repos (a missing repo says so).
+--host takes a bare name or a full http(s):// URL.
+
+Exit 0 when every repo matches, 1 when any differs, 2 on usage/setup errors.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from typing import NoReturn
+
+PAGE = 50
+
+
+def die(msg) -> NoReturn:
+	print(f'forge-diff: {msg}', file=sys.stderr)
+	sys.exit(2)
+
+
+def run(cmd):
+	try:
+		r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+	except OSError as e:
+		die(f'{cmd[0]}: {e.strerror}')
+	return r.returncode, r.stdout, r.stderr.strip()
+
+
+def gh_json(*args):
+	code, out, err = run(['gh', *args])
+	if code:
+		die(f'gh {" ".join(args[:3])}: {err}')
+	return json.loads(out)
+
+
+def github(path, many):
+	"""JSON of a GitHub API path (all pages flattened for lists); None when it does not exist."""
+	code, out, err = run(['gh', 'api', *(['--paginate', '--slurp'] if many else []), path])
+	if code:
+		if 'HTTP 404' in err:
+			return None
+		die(f'gh api {path}: {err}')
+	data = json.loads(out)
+	return [x for page in data for x in page] if many else data
+
+
+def host_get(a, path):
+	"""JSON of a Forgejo API path on the host; None when it does not exist."""
+	if a.tea_login:
+		code, out, err = run(['tea', 'api', '--login', a.tea_login, path])
+		if code:
+			die(f'tea api {path}: {err or out.strip()}')
+		try:
+			data = json.loads(out)
+		except ValueError:
+			die(f'tea api {path}: not JSON: {out[:100]!r}')
+		# tea exits 0 on API errors: the body is Forgejo's {"message", "url", "errors"}.
+		if isinstance(data, dict) and 'message' in data and 'errors' in data:
+			if 'be found' in data['message']:
+				return None
+			die(f'tea api {path}: {data["message"]}')
+		return data
+	token = os.environ.get('CODEBERG_TOKEN')
+	base = a.host if '://' in a.host else f'https://{a.host}'
+	req = urllib.request.Request(f'{base}/api/v1/{path}', headers={'Accept': 'application/json'})
+	if token:
+		req.add_header('Authorization', f'token {token}')
+	try:
+		with urllib.request.urlopen(req, timeout=30) as r:
+			return json.load(r)
+	except urllib.error.HTTPError as e:
+		if e.code == 404:
+			return None
+		die(f'{a.host}: HTTP {e.code} for {path}')
+	except (OSError, ValueError) as e:
+		die(f'{a.host}: {getattr(e, "reason", e)}')
+
+
+def host_list(a, path):
+	out, page = [], 1
+	while True:
+		got = host_get(a, f'{path}?limit={PAGE}&page={page}') or []
+		out += got
+		if len(got) < PAGE:
+			return out
+		page += 1
+
+
+def snap(r, branches, tags):
+	"""The compared facts; GitHub and Forgejo name them alike."""
+
+	def sha(x):
+		return x['commit'].get('sha') or x['commit'].get('id')
+
+	return {
+		'visibility': 'private' if r['private'] else 'public',
+		'archived': 'yes' if r['archived'] else 'no',
+		'default branch': r['default_branch'],
+		'description': (r.get('description') or '').strip(),
+		'topics': sorted(r.get('topics') or []),
+		'branch': {b['name']: sha(b) for b in branches},
+		'tag': {t['name']: sha(t) for t in tags},
+	}
+
+
+def diff(g, c):
+	out = [f'{k}: github {g[k]} codeberg {c[k]}' for k in ('visibility', 'archived', 'default branch') if g[k] != c[k]]
+	if g['description'] != c['description']:
+		out.append('description differs')
+	if g['topics'] != c['topics']:
+		out.append(f'topics: github [{" ".join(g["topics"])}] codeberg [{" ".join(c["topics"])}]')
+	for kind in ('branch', 'tag'):
+		for name in sorted(g[kind].keys() | c[kind].keys()):
+			x, y = g[kind].get(name), c[kind].get(name)
+			if x != y:
+				out.append(f'{kind} {name}: github {(x or "missing")[:7]} codeberg {(y or "missing")[:7]}')
+	return out
+
+
+def compare(repo, a):
+	"""The lines that differ for OWNER/REPO."""
+	owner, name = repo.split('/')
+	g = github(f'repos/{repo}', False)
+	if g is None:
+		return ['missing on github']
+	g = snap(g, github(f'repos/{repo}/branches', True), github(f'repos/{repo}/tags', True))
+	there = f'repos/{a.codeberg_owner or owner}/{name}'
+	c = host_get(a, there)
+	if c is None:
+		anon = (
+			''
+			if a.tea_login or os.environ.get('CODEBERG_TOKEN')
+			else ' (checked anonymously: private repos stay hidden)'
+		)
+		return [f'missing on codeberg{anon}']
+	return diff(g, snap(c, host_list(a, f'{there}/branches'), host_list(a, f'{there}/tags')))
+
+
+def main():
+	ap = argparse.ArgumentParser(
+		description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter
+	)
+	ap.epilog = __doc__.split('\n', 2)[2]
+	ap.add_argument('repos', nargs='*', metavar='OWNER/REPO')
+	ap.add_argument('--owner')
+	ap.add_argument('--codeberg-owner')
+	ap.add_argument('--tea-login', default=os.environ.get('FORGE_DIFF_TEA_LOGIN'))
+	ap.add_argument('--host', default='codeberg.org')
+	a = ap.parse_args()
+	for r in a.repos:
+		if not re.fullmatch(r'[^/\s]+/[^/\s]+', r):
+			ap.error(f'{r!r} is not OWNER/REPO')
+	code, out, err = run(['gh', 'auth', 'status'])
+	if code:
+		die(f'gh is not logged in: {(err or out).splitlines()[0] if err or out else code}')
+	repos = list(a.repos)
+	if a.owner:
+		repos += [
+			r['nameWithOwner']
+			for r in gh_json(
+				'repo', 'list', a.owner, '--no-archived', '--source', '--limit', '200', '--json', 'nameWithOwner'
+			)
+		]
+	elif not repos:
+		repos = [gh_json('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']]
+	repos = list(dict.fromkeys(repos))
+	differs = False
+	# A few repos at a time: every check is five or six API calls.
+	with ThreadPoolExecutor(6) as pool:
+		for repo, lines in zip(repos, pool.map(lambda r: compare(r, a), repos), strict=True):
+			differs |= bool(lines)
+			print(f'{"DIFF" if lines else "ok":<6}{repo}')
+			for line in lines:
+				print(f'    {line}')
+	sys.exit(1 if differs else 0)
+
+
+if __name__ == '__main__':
+	main()

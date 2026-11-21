@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""gh-dependabot: list the open pull requests of dependency bots and, on request, merge the green ones.
+
+	gh-dependabot [OWNER/REPO...] [--owner OWNER] [--merge] [--no-checks-ok] [--method squash|merge|rebase]
+	              [--bots dependabot,renovate]
+
+Repos: the ones given, plus every non-archived, non-fork repo of --owner; none given = the repo of the current folder.
+One line per PR: "OWNER/REPO #12  pass|FAIL|pending|none  CLEAN|BEHIND|DIRTY|...  title" (checks, then merge state).
+--merge runs gh pr merge --delete-branch on each PR whose checks all passed and that GitHub calls MERGEABLE, and
+re-reads the repo after every merge. A PR without any checks is skipped unless --no-checks-ok is given too. A PR that
+conflicts now is left for the bot to rebase. Nothing is forced, closed or approved. --bots names the authors to match
+(dependabot, renovate; "app/" and "[bot]" are ignored).
+
+Exit 0 when nothing failed, 1 when a listed PR has failing checks or a merge failed, 2 on usage/setup errors.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from typing import NoReturn
+
+FIELDS = 'number,title,author,mergeable,mergeStateStatus,statusCheckRollup,url'
+GOOD = ('SUCCESS', 'NEUTRAL', 'SKIPPED')
+WAITING = ('PENDING', 'EXPECTED', 'QUEUED', 'IN_PROGRESS', 'WAITING', 'REQUESTED')
+# GitHub refuses these merges whatever the checks say.
+HELD = ('BLOCKED', 'BEHIND', 'DRAFT')
+
+
+class Fail(Exception):
+	pass
+
+
+def die(msg) -> NoReturn:
+	print(f'gh-dependabot: {msg}', file=sys.stderr)
+	sys.exit(2)
+
+
+def gh(*args):
+	try:
+		r = subprocess.run(['gh', *args], capture_output=True, text=True, check=False)
+	except OSError as e:
+		die(f'gh: {e.strerror}')
+	return r.returncode, r.stdout, r.stderr.strip()
+
+
+def norm(login):
+	"""'app/dependabot' (gh pr list) and 'dependabot[bot]' (REST) are the same bot."""
+	return login.strip().lower().removeprefix('app/').removesuffix('[bot]')
+
+
+def checks(rollup):
+	"""pass, FAIL, pending or none for a statusCheckRollup (CheckRun conclusions and StatusContext states)."""
+	states = []
+	for c in rollup or []:
+		if c.get('__typename') == 'StatusContext':
+			states.append(c.get('state') or 'PENDING')
+		else:
+			states.append((c.get('conclusion') if c.get('status') == 'COMPLETED' else None) or 'PENDING')
+	if not states:
+		return 'none'
+	if any(s not in GOOD + WAITING for s in states):
+		return 'FAIL'
+	return 'pending' if any(s in WAITING for s in states) else 'pass'
+
+
+def read(repo, bots, settle):
+	"""The repo's open bot PRs, oldest first, each with its summarised 'checks'."""
+	prs = []
+	for tries in range(5 if settle else 1):
+		if tries:
+			time.sleep(2)
+		code, out, err = gh('pr', 'list', '-R', repo, '--limit', '200', '--json', FIELDS)
+		if code:
+			raise Fail(err)
+		try:
+			prs = json.loads(out)
+		except ValueError as e:
+			raise Fail(f'gh pr list: {e}') from e
+		prs = sorted(
+			(p for p in prs if norm((p.get('author') or {}).get('login', '')) in bots), key=lambda p: p['number']
+		)
+		# Right after a merge GitHub still works out whether the other PRs conflict.
+		if not (settle and any(p['mergeable'] == 'UNKNOWN' for p in prs)):
+			break
+	for p in prs:
+		p['checks'] = checks(p['statusCheckRollup'])
+	return prs
+
+
+def skip_reason(p, no_checks_ok, before):
+	"""Why the PR is not merged (None: it would be)."""
+	if p['checks'] in ('FAIL', 'pending'):
+		return f'checks {p["checks"]}'
+	if p['checks'] == 'none' and not no_checks_ok:
+		return 'no checks (--no-checks-ok merges these)'
+	if p['mergeable'] == 'CONFLICTING':
+		return (
+			'conflicting now' if before.get(p['number']) == 'MERGEABLE' else 'conflicting'
+		) + ', the bot will rebase'
+	if p['mergeable'] != 'MERGEABLE':
+		return f'mergeable {p["mergeable"]}'
+	if p['mergeStateStatus'] in HELD:
+		return f'merge state {p["mergeStateStatus"]}'
+	return None
+
+
+def merge_ready(repo, prs, a, bots):
+	"""Merge what is ready, one at a time with a re-read in between; True when a merge failed."""
+	before = {p['number']: p['mergeable'] for p in prs}
+	tried, failed = set(), False
+	while True:
+		todo = [p for p in prs if p['number'] not in tried]
+		pr = next((p for p in todo if not skip_reason(p, a.no_checks_ok, before)), None)
+		if pr is None:
+			break
+		n = pr['number']
+		tried.add(n)
+		code, _, err = gh('pr', 'merge', str(n), '-R', repo, f'--{a.method}', '--delete-branch')
+		if code:
+			failed = True
+			print(f'  #{n} merge FAILED: {err}')
+			continue
+		print(f'  #{n} merged ({a.method})')
+		prs = read(repo, bots, True)
+	for p in prs:
+		if p['number'] not in tried:
+			print(f'  #{p["number"]} skipped: {skip_reason(p, a.no_checks_ok, before)}')
+	return failed
+
+
+def repos_of(a):
+	repos = list(a.repos)
+	if a.owner:
+		code, out, err = gh(
+			'repo', 'list', a.owner, '--no-archived', '--source', '--limit', '200', '--json', 'nameWithOwner'
+		)
+		if code:
+			die(f'gh repo list {a.owner}: {err}')
+		repos += [r['nameWithOwner'] for r in json.loads(out)]
+	elif not repos:
+		code, out, err = gh('repo', 'view', '--json', 'nameWithOwner')
+		if code:
+			die(f'no OWNER/REPO given and this folder is no GitHub repo: {err}')
+		repos = [json.loads(out)['nameWithOwner']]
+	return list(dict.fromkeys(repos))
+
+
+def main():
+	ap = argparse.ArgumentParser(
+		description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter
+	)
+	ap.epilog = __doc__.split('\n', 2)[2]
+	ap.add_argument('repos', nargs='*', metavar='OWNER/REPO')
+	ap.add_argument('--owner')
+	ap.add_argument('--merge', action='store_true')
+	ap.add_argument('--no-checks-ok', action='store_true')
+	ap.add_argument('--method', choices=('squash', 'merge', 'rebase'), default='squash')
+	ap.add_argument('--bots', default='dependabot,renovate')
+	a = ap.parse_args()
+	for r in a.repos:
+		if not re.fullmatch(r'[^/\s]+/[^/\s]+', r):
+			ap.error(f'{r!r} is not OWNER/REPO')
+	bots = {norm(b) for b in a.bots.split(',') if b.strip()}
+	code, out, err = gh('auth', 'status')
+	if code:
+		die(f'gh is not logged in: {(err or out).splitlines()[0] if err or out else code}')
+	repos = repos_of(a)
+	listed, bad, errors = 0, False, False
+	for repo in repos:
+		try:
+			prs = read(repo, bots, a.merge)
+			for p in prs:
+				print(f'{repo} #{p["number"]}  {p["checks"]:<7}  {p["mergeStateStatus"]:<9}  {p["title"]}')
+			listed += len(prs)
+			bad |= any(p['checks'] == 'FAIL' for p in prs)
+			if a.merge:
+				bad |= merge_ready(repo, prs, a, bots)
+		except Fail as e:
+			errors = True
+			print(f'gh-dependabot: {repo}: {e}', file=sys.stderr)
+	if not listed and not errors:
+		print(f'no open pull requests from {", ".join(sorted(bots))} in {len(repos)} repo(s)')
+	sys.exit(2 if errors else 1 if bad else 0)
+
+
+if __name__ == '__main__':
+	main()

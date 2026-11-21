@@ -40,7 +40,7 @@ jobs:
         run: |
           mkdir .pycheck
           for f in bin/*; do [ "$f" = bin/webshot ] || cp "$f" ".pycheck/${f#bin/}.py"; done
-          basedpyright --warnings .pycheck
+          basedpyright --warnings .pycheck tests
 
       - name: Shell
         run: |

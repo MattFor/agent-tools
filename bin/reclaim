@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""reclaim: find disk space that can be freed safely. Reports only, never deletes anything.
+
+	reclaim [PATH...] [--min 50M] [--older DAYS] [-n 40] [--json]
+
+PATH defaults to $HOME. Lists what regenerates or is disposable, biggest first: Rust target/ dirs, node_modules,
+Python venvs and caches, build/dist/.next/.gradle/.parcel-cache beside a project file, ~/.cache subdirs and other tool
+caches, the trash, core dumps, and big old files in ~/downloads. One row per item: size, age (of the newest file inside),
+kind, path, the command that frees it; then a total. Symlinks are never followed, each PATH stays on its filesystem, and
+sizes are disk blocks with hard links counted once.
+--min is the smallest size shown (K, M, G, T suffixes), --older the age in days a download needs (30), -n the number of
+rows (40). --json prints a list of objects (path, size in bytes, age_days, kind, hint) instead of rows.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import stat
+import time
+
+HOME = os.path.expanduser('~')
+CACHE_HOME = os.path.join(HOME, '.cache')
+DOWNLOADS = (os.path.join(HOME, 'downloads'), os.path.join(HOME, 'Downloads'))
+# Whole directories that are caches: (kind, command that empties them).
+CACHES = {
+	os.path.join(HOME, '.npm', '_cacache'): ('cache', 'npm cache clean --force'),
+	os.path.join(HOME, '.cargo', 'registry', 'cache'): ('cache', 'rm -rf'),
+	os.path.join(HOME, '.local', 'share', 'Trash'): ('trash', 'gio trash --empty'),
+	os.path.join(CACHE_HOME, 'uv'): ('cache', 'uv cache clean'),
+	os.path.join(CACHE_HOME, 'pip'): ('cache', 'pip cache purge'),
+}
+CACHE_DIRS = {
+	'__pycache__': 'pycache',
+	'.pytest_cache': 'pytest-cache',
+	'.ruff_cache': 'ruff-cache',
+	'.mypy_cache': 'mypy-cache',
+}
+BUILD_DIRS = ('build', 'dist', '.next', '.gradle', '.parcel-cache')
+PROJECT_FILES = {
+	'package.json',
+	'Cargo.toml',
+	'pyproject.toml',
+	'setup.py',
+	'setup.cfg',
+	'CMakeLists.txt',
+	'Makefile',
+	'pom.xml',
+	'build.gradle',
+	'build.gradle.kts',
+	'settings.gradle',
+	'settings.gradle.kts',
+	'go.mod',
+	'tsconfig.json',
+}
+CORE = re.compile(r'core(\.\d+)?')
+# Commands that measure what this scan cannot see.
+OTHERS = ('docker system df', 'podman system df', 'journalctl --disk-usage', 'flatpak uninstall --unused')
+
+
+def classify(e, siblings):
+	"""(kind, hint) when the directory entry is reclaimable, else None."""
+	if e.path in CACHES:
+		return CACHES[e.path]
+	if not e.is_dir(follow_symlinks=False):
+		return ('core', 'rm') if CORE.fullmatch(e.name) and e.is_file(follow_symlinks=False) else None
+	if os.path.dirname(e.path) == CACHE_HOME:
+		return 'cache', 'rm -rf'
+	if e.name == 'target' and ('Cargo.toml' in siblings or os.path.exists(os.path.join(e.path, 'CACHEDIR.TAG'))):
+		return 'rust-target', 'cargo clean'
+	if e.name == 'node_modules' and 'package.json' in siblings:
+		return 'node-modules', 'rm -rf; reinstall with the package manager'
+	if e.name in CACHE_DIRS:
+		return CACHE_DIRS[e.name], 'rm -rf'
+	if e.name in BUILD_DIRS and PROJECT_FILES & siblings:
+		return e.name.lstrip('.'), 'rm -rf'
+	return None
+
+
+def measure(path, seen):
+	"""(bytes on disk, newest mtime) of path and everything below it on its filesystem."""
+	try:
+		st = os.lstat(path)
+	except OSError:
+		return 0, 0.0
+	total, newest, dev = st.st_blocks * 512, st.st_mtime, st.st_dev
+	stack = [path] if stat.S_ISDIR(st.st_mode) else []
+	while stack:
+		try:
+			with os.scandir(stack.pop()) as it:
+				for e in it:
+					try:
+						s = e.stat(follow_symlinks=False)
+					except OSError:
+						continue
+					isdir = stat.S_ISDIR(s.st_mode)
+					if s.st_dev != dev or (s.st_nlink > 1 and not isdir and (s.st_dev, s.st_ino) in seen):
+						continue
+					if s.st_nlink > 1 and not isdir:
+						seen.add((s.st_dev, s.st_ino))
+					total += s.st_blocks * 512
+					newest = max(newest, s.st_mtime)
+					if isdir:
+						stack.append(e.path)
+		except OSError:
+			continue
+	return total, newest
+
+
+def scan(roots, min_size, older, now):
+	"""{path: item} for everything reclaimable below the roots."""
+	found, seen = {}, set()
+
+	def record(path, kind, hint, download=False):
+		"""Store the item (a download only when big and old enough); say whether it was stored."""
+		if path in found:
+			return True
+		size, newest = measure(path, seen)
+		age = max(0, int((now - newest) // 86400))
+		if download and (size < min_size or age < older):
+			return False
+		found[path] = {'path': path, 'size': size, 'age_days': age, 'kind': kind, 'hint': hint}
+		return True
+
+	for root in roots:
+		if root in CACHES:
+			record(root, *CACHES[root])
+			continue
+		dev, stack = os.stat(root).st_dev, [root]
+		while stack:
+			path = stack.pop()
+			try:
+				with os.scandir(path) as it:
+					entries = list(it)
+			except OSError:
+				continue
+			names = {e.name for e in entries}
+			if 'pyvenv.cfg' in names:
+				record(path, 'venv', 'rm -rf')
+				continue
+			for e in entries:
+				if e.name == '.git':
+					continue
+				if c := classify(e, names):
+					record(e.path, *c)
+				elif path in DOWNLOADS and record(e.path, 'download', 'review, then rm', download=True):
+					continue
+				elif e.is_dir(follow_symlinks=False):
+					try:
+						same = e.stat(follow_symlinks=False).st_dev == dev
+					except OSError:
+						same = False
+					if same:
+						stack.append(e.path)
+	return found
+
+
+def human(n):
+	if n < 1024:
+		return f'{n}B'
+	for unit in 'KMGT':
+		n /= 1024
+		if n < 1024 or unit == 'T':
+			return f'{n:.1f}{unit}'
+
+
+def tilde(path):
+	return '~' + path[len(HOME) :] if path == HOME or path.startswith(HOME + os.sep) else path
+
+
+def size_arg(text):
+	m = re.fullmatch(r'(\d+(?:\.\d+)?)([KMGT]?)(?:i?B)?', text.strip(), re.IGNORECASE)
+	if not m:
+		raise argparse.ArgumentTypeError(f'bad size {text!r} (like 500K, 50M, 2G)')
+	return int(float(m[1]) * 1024 ** ' KMGT'.index(m[2].upper() or ' '))
+
+
+def main():
+	ap = argparse.ArgumentParser(
+		description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter
+	)
+	ap.epilog = __doc__.split('\n', 2)[2]
+	ap.add_argument('paths', nargs='*', metavar='PATH', help='default: $HOME')
+	ap.add_argument('--min', type=size_arg, default=50 * 1024**2, metavar='SIZE', help='smallest item shown (50M)')
+	ap.add_argument('--older', type=float, default=30, metavar='DAYS', help='age a download needs (30)')
+	ap.add_argument('-n', type=int, default=40, metavar='N', help='rows shown (40)')
+	ap.add_argument('--json', action='store_true', help='print a list of objects instead of rows')
+	a = ap.parse_args()
+	roots = [os.path.abspath(p) for p in a.paths or [HOME]]
+	for r in roots:
+		if not os.path.isdir(r):
+			ap.error(f'{r}: not a directory')
+	found = [i for i in scan(roots, a.min, a.older, time.time()).values() if i['size'] >= a.min]
+	found.sort(key=lambda i: (-i['size'], i['path']))
+	top = found[: a.n]
+	if a.json:
+		print('[\n' + ',\n'.join(json.dumps(i) for i in top) + '\n]')
+		return
+	rows = [(human(i['size']), f'{i["age_days"]}d', i['kind'], tilde(i['path']), i['hint']) for i in top]
+	age, kind = (max((len(r[k]) for r in rows), default=0) for k in (1, 2))
+	for r in rows:
+		print(f'{r[0]:>6}  {r[1]:>{age}}  {r[2]:<{kind}}  {r[3]}  ({r[4]})')
+	shown = f', {len(top)} shown' if len(top) < len(found) else ''
+	print(f'total {human(sum(i["size"] for i in found))} in {len(found)} items{shown}')
+	if todo := [c for c in OTHERS if shutil.which(c.split()[0])]:
+		print('not measured here: ' + '; '.join(todo))
+
+
+if __name__ == '__main__':
+	main()
