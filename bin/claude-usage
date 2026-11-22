@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""claude-usage: print how much of the Claude subscription limits is used, from Claude Code's own login.
+
+	claude-usage [--json] [--fail-above N] [--watch SECS]
+
+One line per window: name (5h, 7d, plus model-specific ones such as "opus 7d"), percent used, reset time in local
+time and "in Xh Ym". Reads the OAuth token from ~/.claude/.credentials.json ($CLAUDE_CONFIG_DIR/.credentials.json)
+and asks api.anthropic.com/api/oauth/usage; the token is never printed. $CLAUDE_USAGE_URL replaces that URL.
+--json prints the raw response instead. --fail-above N exits 1 when any window is at or above N percent: use it
+before starting many agents, or to pace work against the 5-hour and weekly limits.
+--watch SECS repeats and prints again only when a window changes. The endpoint rate-limits frequent polling, so
+SECS is raised to 300 when lower; a 429 waits for its Retry-After if that is longer. Stops on exit 1 or 2.
+
+Exit 0 ok, 1 a window is at or above --fail-above, 2 not logged in / login expired / usage error,
+3 network or server error, 4 rate limited ("rate limited, try again later"; Retry-After is shown when sent).
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+URL = 'https://api.anthropic.com/api/oauth/usage'
+MIN_WATCH = 300
+SHORT = {'five_hour': '5h', 'seven_day': '7d', 'session': '5h', 'weekly': '7d'}
+
+
+class Fail(Exception):
+	def __init__(self, msg, code, wait=0):
+		super().__init__(msg)
+		self.code, self.wait = code, wait
+
+
+def token():
+	base = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
+	for name in ('.credentials.json', '.credentials'):
+		try:
+			with open(os.path.join(base, name)) as f:
+				if t := json.load(f)['claudeAiOauth']['accessToken']:
+					return t
+		except (OSError, ValueError, KeyError, TypeError):
+			pass
+	raise Fail(f'no Claude login found in {base}: run claude and log in', 2)
+
+
+def fetch():
+	req = urllib.request.Request(
+		os.environ.get('CLAUDE_USAGE_URL') or URL,
+		headers={'Authorization': 'Bearer ' + token(), 'anthropic-beta': 'oauth-2025-04-20'},
+	)
+	try:
+		with urllib.request.urlopen(req, timeout=10) as r:
+			return json.loads(r.read())
+	except urllib.error.HTTPError as e:
+		if e.code == 401:
+			raise Fail('login expired: run claude and log in again', 2) from None
+		if e.code == 429:
+			try:
+				wait = max(0, int(float(e.headers.get('Retry-After') or 0)))
+			except ValueError:
+				wait = 0
+			raise Fail('rate limited, try again later' + (f' (retry after {wait}s)' if wait else ''), 4, wait) from None
+		raise Fail(f'server answered {e.code}', 3) from None
+	except (OSError, ValueError) as e:
+		raise Fail(f'cannot read usage: {e}', 3) from None
+
+
+def windows(u):
+	"""[(name, percent, reset epoch or None)] from either response shape."""
+	out = []
+	for lim in u.get('limits') or []:
+		if lim.get('percent') is None:
+			continue
+		g = SHORT.get(lim.get('group'), lim.get('group') or '?')
+		m = ((lim.get('scope') or {}).get('model') or {}).get('display_name')
+		out.append((f'{m.lower()} {g}' if m else g, lim['percent'], epoch(lim.get('resets_at'))))
+	if out:
+		return out
+	for key, v in u.items():
+		if isinstance(v, dict) and v.get('utilization') is not None:
+			base = next((k for k in SHORT if key.startswith(k)), None)
+			name = SHORT[base] + key[len(base) :].replace('_', ' ') if base else key.replace('_', ' ')
+			out.append((name, v['utilization'], epoch(v.get('resets_at'))))
+	return out
+
+
+def epoch(text):
+	try:
+		return datetime.fromisoformat(text).timestamp() if text else None
+	except (ValueError, TypeError):
+		return None
+
+
+def line(name, pct, reset, now, width):
+	head = f'{name:<{width}}  {round(pct, 1):>5g}%'
+	if reset is None:
+		return head + '  resets -'
+	left = max(0, int(reset - now) // 60)
+	when = datetime.fromtimestamp(reset).strftime('%a %d %b %H:%M')
+	return f'{head}  resets {when} (in {left // 60}h {left % 60}m)'
+
+
+def render(ws, now):
+	width = max((len(w[0]) for w in ws), default=0)
+	return [line(*w, now, width) for w in ws]
+
+
+def main():
+	ap = argparse.ArgumentParser(
+		description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter
+	)
+	ap.epilog = __doc__.split('\n', 2)[2]
+	ap.add_argument('--json', action='store_true', help='print the raw response')
+	ap.add_argument('--fail-above', type=float, metavar='N', help='exit 1 when any window is at or above N percent')
+	ap.add_argument('--watch', type=float, metavar='SECS', help=f'repeat, printing on change (at least {MIN_WATCH})')
+	a = ap.parse_args()
+	if a.watch is not None and a.watch < MIN_WATCH:
+		print(
+			f'claude-usage: --watch raised to {MIN_WATCH}s (the endpoint rate-limits faster polling)', file=sys.stderr
+		)
+		a.watch = MIN_WATCH
+	last, rc = None, 0
+	while True:
+		wait = a.watch or 0
+		try:
+			u = fetch()
+			ws = windows(u)
+			shown = u if a.json else [(w[0], w[1], w[2]) for w in ws]
+			if shown != last:
+				last = shown
+				if a.json:
+					print(json.dumps(u, indent=2))
+				else:
+					print('\n'.join(render(ws, time.time())) or 'no usage windows reported')
+					sys.stdout.flush()
+			if a.fail_above is not None and any(w[1] >= a.fail_above for w in ws):
+				rc = 1
+		except Fail as e:
+			print(f'claude-usage: {e}', file=sys.stderr)
+			if not a.watch or e.code == 2:
+				sys.exit(e.code)
+			wait = max(wait, e.wait)
+		if not a.watch or rc:
+			sys.exit(rc)
+		time.sleep(wait)
+
+
+if __name__ == '__main__':
+	main()

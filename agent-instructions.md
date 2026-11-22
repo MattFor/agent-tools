@@ -28,6 +28,10 @@ Use these instead of writing the same heredoc, loop or ssh line again. Each has 
   check state; `--merge` merges only the green, mergeable ones (only when the user asked for merging).
 - **GitHub vs Codeberg mirrors**: `forge-diff [--owner OWNER | REPO…] --tea-login NAME` reports missing repos,
   stale branches, tags, visibility, description and topic differences.
+- **Claude usage limits**: `claude-usage [--json] [--fail-above N] [--watch SECS]` prints the 5-hour and weekly
+  windows (percent used, reset time). Run it before starting many agents or a long job, and pace work against it;
+  `--fail-above 80` exits 1 when a window is nearly used (exit 2 login expired, 3 network, 4 rate limited). The
+  endpoint rate-limits: call it rarely, and `--watch` never polls faster than every 300 s.
 - **JSON**: `jshape FILE` (or stdin) for the structure, then `jq` (`gh … --jq`) for the values; `jshape --paths`
   for greppable `.a.b[3] = v` lines. Never `python3 -c 'import json…'` to pick a field.
 - **Notebooks**: `nbdump NB.ipynb [CELLS] [--errors]`.
